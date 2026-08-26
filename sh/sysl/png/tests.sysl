@@ -1,0 +1,559 @@
+module sh.sysl.png
+
+@tests
+
+/** The files these tests read, and what the reader has to make of them.
+ *
+ * Nothing here opens anything -- every image is the real bytes of a real PNG, written out in hex and
+ * unpacked into a buffer at the start of each check. **They were produced by a different encoder
+ * than the one that reads them**, which is the only reason any of this proves anything: a decoder
+ * tested against its own encoder tests that two mistakes agree. The checksum vectors are the
+ * published ones for the same reason.
+ *
+ * Hex rather than a list of numbers, and each file is one text block: the lines join at the trailing
+ * `\` in the lexer, so a file is a single constant with no runtime work behind it, where assembling
+ * one from pieces with `+=` allocated and copied once per line. The block's own indentation is
+ * incidental and does not reach the value, which is what lets the data sit at the indentation the
+ * code around it is written at.
+ */
+
+import sh.sysl.png.inflate
+
+private nibble(c: u8) -> u8 = if c >= 97 then c - 87 else c - 48
+
+// Unpack a hex string into bytes, answering how many there were. The one direction that works:
+// bytes cannot be turned into a string, but a string's bytes can always be read.
+// Two counters advancing at different rates — the source by two characters and the output by one
+// byte — which is what the three-clause `for` is for.
+unhex(s: string, out: []u8) -> usize
+    var n: usize = 0
+
+    for var i: usize = 0; i + 1 < s.len; i += 2
+        out[n] = nibble(s[i]) << 4 | nibble(s[i + 1])
+        n += 1
+
+    n
+end unhex
+
+// A 2x2 truecolour image: red, green on the first row, blue, yellow on the second.
+rgb() -> string = """
+    89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a\
+    730000001449444154789c63f8cfc0c000c20cffffff6700001eef04fca3c8b4\
+    f70000000049454e44ae426082"""
+
+// 4x4 greyscale, every pixel a multiple of 17 in reading order.
+gray() -> string = """
+    89504e470d0a1a0a0000000d49484452000000040000000408000000008c9ac1\
+    a20000001d49444154789c63601054326670094d2b67e898b96a37c399bbeffe\
+    030033e007f9c0f536f00000000049454e44ae426082"""
+
+// 4x4 through a four-entry palette, the index cycling along each diagonal.
+paletted() -> string = """
+    89504e470d0a1a0a0000000d49484452000000040000000408030000009e2f6e\
+    4c0000000c504c5445000000ff000000ff000000ff9bc013dc00000014494441\
+    54789c636060646206630610cd0062030001040019427b918c0000000049454e\
+    44ae426082"""
+
+// 2x2 with an alpha channel, transparent through to opaque.
+rgba() -> string = """
+    89504e470d0a1a0a0000000d494844520000000200000002080600000072b60d\
+    240000001549444154789c63f8cf0004ff194241e4aaff400000338907f91e86\
+    b0160000000049454e44ae426082"""
+
+// 2x2 greyscale with an alpha channel.
+grayalpha() -> string = """
+    89504e470d0a1a0a0000000d4948445200000002000000020804000000d8bfc5\
+    af0000001249444154789c6360f81fba8a6155e87f060013f603fd3a2f75c600\
+    00000049454e44ae426082"""
+
+// 8x8 greyscale, black and white in a checkerboard — small enough to print.
+checker() -> string = """
+    89504e470d0a1a0a0000000d4948445200000008000000080800000000e164e1\
+    570000001349444154789c63f8cf00810c0cffd1204922007c041fe1a91bcce4\
+    0000000049454e44ae426082"""
+
+// 4x5 truecolour, encoded with a different filter on every row: none, sub, up, average, Paeth.
+filtered() -> string = """
+    89504e470d0a1a0a0000000d4948445200000004000000050802000000edcfda\
+    8c0000002a49444154789c636060e763e61264e315e1141067e4119662860126\
+    1e24c02c2123cf01032c200118000050f3025397509ded0000000049454e44ae\
+    426082"""
+
+// The same 2x2 image, its compressed data cut across three IDAT chunks.
+split() -> string = """
+    89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a\
+    730000000749444154789c63f8cfc0c0ab586406000000074944415400c20cff\
+    ffff67f0e9b20f000000064944415400001eef04fcf2e9d5c20000000049454e\
+    44ae426082"""
+
+// The same 2x2 image again, with a gAMA chunk before the pixels and a tEXt chunk after them.
+extra() -> string = """
+    89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a\
+    730000000467414d410000b18f0bfc61050000001449444154789c63f8cfc0c0\
+    00c20cffffff6700001eef04fca3c8b4f70000001774455874436f6d6d656e74\
+    00612067756964652070726f626c656d9fc13a160000000049454e44ae426082"""
+
+// 8x1 greyscale whose pixel data was deflated with compression turned off, so its one block is
+// stored rather than coded.
+stored() -> string = """
+    89504e470d0a1a0a0000000d4948445200000008000000010800000000c66bb0\
+    9f00000014494441547801010900f6ff000010203040506070054901c17496a2\
+    480000000049454e44ae426082"""
+
+// The 2x2 image again, its first row claiming a filter the format does not have.
+badfilter() -> string = """
+    89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a\
+    730000001449444154789c63fdcfc0c000c20cffffff6700001f350501b5d330\
+    180000000049454e44ae426082"""
+
+// Bare zlib streams, one for each kind of deflate block.
+
+// A stored block: "hello, world" verbatim.
+zstored() -> string = "7801010c00f3ff68656c6c6f2c20776f726c641d540489"
+
+// A fixed-code block: "abracadabra abracadabra", short enough that a table of its own would cost
+// more than it saved.
+zfixed() -> string = "78da4b4c2a4a4c4e4c4904520a89083600695508c9"
+
+// A dynamic-code block: the squares of 0 through 59, separated by spaces. Digits and spaces only,
+// so the distribution is skewed enough that carrying a table pays for itself.
+zdyn() -> string = """
+    78da158ec101c0300802576104516b74ffc50a2f1205bc00d13870901f6ad087\
+    692cc10830a5dddaca71b2c8939f740f952dbfd2f2754bb7f1e5e17b83916fa4\
+    4fffa7f96a7ff2ddb85741861a4855d19d4c95b37ca57deef3dd31c098e48988\
+    db661061862968e28c435634b283225322c7afe7d97a7bf29513a57e438bbcd4\
+    57bdfc01ea2d2e92"""
+
+// Three hundred copies of one byte, which the encoder wrote as a single back-reference of
+// distance one.
+zrun() -> string = "78daabaa1a05c4020012e48ef9"
+
+// A bare deflate block — no zlib wrapper — holding one literal byte and then a match five bytes
+// back, which is four bytes before the stream began. Written by hand: no encoder emits this.
+faraway() -> string = "4b041200"
+
+// A match whose distance is spelled with the one five-bit pattern the fixed distance table leaves
+// undefined, there being thirty distances and room for thirty-two. The two bytes on the end are
+// there so that the decoder runs out of *table* before it runs out of *stream*: a code that stands
+// for nothing is indistinguishable from a code still being read until fifteen bits have gone by.
+nosuchcode() -> string = "4b047effff"
+
+// A length symbol two past the last one the format defines.
+toolong() -> string = "1b03"
+
+// A block that says it carries 288 literal codes, two more than there are.
+toomany() -> string = "fd0000"
+
+// ------------------------------------------------------------------------------------- machinery
+//
+// Every helper below answers a **string**, and a refusal answers the message a caller would print.
+// So a wrong answer and a right one are compared the same way, and a test that expected a picture
+// and got a fault reads as a difference between two texts rather than as a crash.
+
+private read32(b: []u8, at: usize) -> u32
+    u32(b[at]) << 24 | u32(b[at + 1]) << 16 | u32(b[at + 2]) << 8 | u32(b[at + 3])
+
+private write32(b: []u8, at: usize, v: u32)
+    b[at] = u8(v >> 24)
+    b[at + 1] = u8(v >> 16 & 255)
+    b[at + 2] = u8(v >> 8 & 255)
+    b[at + 3] = u8(v & 255)
+
+// Put a chunk's checksum back after tampering with it, so that a test of what the *reader* makes of
+// a changed header is not answered by the checksum first.
+private reseal(b: []u8, at: usize)
+    var len = usize(read32(b, at))
+
+    write32(b, at + 8 + len, crc32(b[at + 4..<at + 8 + len]))
+
+// Bytes as text. Every stream these tests unpack is ASCII, which is what makes this legible; a
+// decoder that produced the wrong bytes would produce the wrong text and say so.
+private text_of(b: []u8, n: usize) -> string
+    var s = ""
+
+    for i in 0..<n
+        s += str(char(u32(b[i])))
+
+    s
+end text_of
+
+// ------------------------------------------------------------------------------------- checksums
+
+@test
+the_crc_of_known_texts()
+    assert_eq(f"${crc32("".bytes)}%08x", "00000000")
+    assert_eq(f"${crc32("a".bytes)}%08x", "e8b7be43")
+    assert_eq(f"${crc32("abc".bytes)}%08x", "352441c2")
+    assert_eq(f"${crc32("The quick brown fox jumps over the lazy dog".bytes)}%08x", "414fa339")
+end the_crc_of_known_texts
+
+@test
+the_adler_of_the_same_texts()
+    assert_eq(f"${inflate.adler32("".bytes)}%08x", "00000001")
+    assert_eq(f"${inflate.adler32("abc".bytes)}%08x", "024d0127")
+    assert_eq(f"${inflate.adler32("The quick brown fox jumps over the lazy dog".bytes)}%08x", "5bdc0fda")
+end the_adler_of_the_same_texts
+
+// --------------------------------------------------------------------------------------- deflate
+
+private unpacked(hex: string) -> string
+    var src: [256]u8
+    var out: [512]u8
+    var n = unhex(hex, src)
+
+    inflate.zlib(src[..<n], out) match
+        Err(f) -> s"error: ${inflate.describe(f)}"
+        Ok(k) -> text_of(out, k)
+end unpacked
+
+// A stream with one byte changed, which is how a decoder finds out whether it is checking or merely
+// reading.
+private mangled(hex: string, at: usize, value: u8) -> string
+    var src: [256]u8
+    var out: [512]u8
+    var n = unhex(hex, src)
+
+    src[at] = value
+
+    inflate.zlib(src[..<n], out) match
+        Err(f) -> s"error: ${inflate.describe(f)}"
+        Ok(k) -> text_of(out, k)
+end mangled
+
+private chopped(hex: string, keep: usize) -> string
+    var src: [256]u8
+    var out: [512]u8
+
+    unhex(hex, src)
+
+    inflate.zlib(src[..<keep], out) match
+        Err(f) -> s"error: ${inflate.describe(f)}"
+        Ok(k) -> text_of(out, k)
+end chopped
+
+// A bare deflate stream, with no wrapper to check it, which is the only way to ask what the decoder
+// does with bits no encoder would have written.
+private bare(hex: string) -> string
+    var src: [256]u8
+    var out: [512]u8
+    var n = unhex(hex, src)
+
+    inflate.raw(src[..<n], out) match
+        Err(f) -> s"error: ${inflate.describe(f)}"
+        Ok(k) -> text_of(out, k)
+end bare
+
+private crowded(hex: string, room: usize) -> string
+    var src: [256]u8
+    var out: [512]u8
+    var n = unhex(hex, src)
+
+    inflate.zlib(src[..<n], out[..<room]) match
+        Err(f) -> s"error: ${inflate.describe(f)}"
+        Ok(k) -> text_of(out, k)
+end crowded
+
+private squares() -> string
+    var s = ""
+
+    for i in 0..<60
+        if i > 0 then s += " "
+
+        s += str(i * i)
+
+    s
+end squares
+
+private repeated(c: string, n: int) -> string
+    var s = ""
+
+    for i in 0..<n
+        s += c
+
+    s
+end repeated
+
+@test
+every_kind_of_block_unpacks()
+    assert_eq(unpacked(zstored()), "hello, world")
+    assert_eq(unpacked(zfixed()), "abracadabra abracadabra")
+    assert_eq(unpacked(zdyn()), squares())
+    assert_eq(unpacked(zrun()), repeated("z", 300))
+end every_kind_of_block_unpacks
+
+@test
+the_streams_the_decoder_refuses()
+    assert_eq(mangled(zstored(), 0, 0x79), "error: compression method 9 is not deflate")
+    assert_eq(mangled(zstored(), 1, 0x00), "error: the header's check bits do not agree")
+    assert_eq(mangled(zstored(), 0, 0x88), "error: a window wider than the format allows")
+    assert_eq(mangled(zstored(), 1, 0x20), "error: a stream wanting a dictionary it was not given")
+    assert_eq(mangled(zstored(), 7, 0x69), "error: the checksum says 1d540489 and the bytes say 1d60048a")
+    assert_eq(chopped(zfixed(), 8), "error: the stream ends in the middle of something")
+    assert_eq(crowded(zrun(), 100), "error: no room left for what the stream unpacks to")
+end the_streams_the_decoder_refuses
+
+@test
+the_bits_no_encoder_would_have_written()
+    assert_eq(bare("07"), "error: a block of no known kind")
+    assert_eq(bare("0105000000"), "error: a stored block whose length and complement disagree")
+    assert_eq(bare("010500faff"), "error: the stream ends in the middle of something")
+    assert_eq(bare(faraway()), "error: a match reaching 5 bytes back, before anything was written")
+    assert_eq(bare(nosuchcode()), "error: a code that stands for nothing")
+    assert_eq(bare(toolong()), "error: length symbol 286 is past the end of the table")
+    assert_eq(bare(toomany()), "error: a code table claiming more codes than its lengths leave room for")
+end the_bits_no_encoder_would_have_written
+
+// ---------------------------------------------------------------------------------------- images
+
+private headed(file: string) -> string
+    var src: [256]u8
+    var n = unhex(file, src)
+
+    decode(src[..<n]) match
+        Err(f) -> s"error: ${describe(f)}"
+        Ok(img) -> f"${img.width}%dx${img.height}%d type ${img.kind}%d"
+end headed
+
+private pixel(file: string, x: usize, y: usize) -> string
+    var src: [256]u8
+    var n = unhex(file, src)
+
+    decode(src[..<n]) match
+        Err(f) -> s"error: ${describe(f)}"
+        Ok(img) ->
+            var p = img.at(x, y)
+
+            f"${p.r}%d ${p.g}%d ${p.b}%d ${p.a}%d"
+end pixel
+
+@test
+a_header_of_every_colour_type()
+    assert_eq(headed(rgb()), "2x2 type 2")
+    assert_eq(headed(gray()), "4x4 type 0")
+    assert_eq(headed(paletted()), "4x4 type 3")
+    assert_eq(headed(rgba()), "2x2 type 6")
+    assert_eq(headed(grayalpha()), "2x2 type 4")
+    assert_eq(headed(checker()), "8x8 type 0")
+end a_header_of_every_colour_type
+
+@test
+the_pixels_underneath()
+    assert_eq(pixel(rgb(), 0, 0), "255 0 0 255")
+    assert_eq(pixel(rgb(), 1, 0), "0 255 0 255")
+    assert_eq(pixel(rgb(), 0, 1), "0 0 255 255")
+    assert_eq(pixel(rgb(), 1, 1), "255 255 0 255")
+    assert_eq(pixel(gray(), 0, 0), "0 0 0 255")
+    assert_eq(pixel(gray(), 3, 0), "51 51 51 255")
+    assert_eq(pixel(gray(), 0, 1), "68 68 68 255")
+    assert_eq(pixel(gray(), 3, 3), "255 255 255 255")
+    assert_eq(pixel(paletted(), 1, 0), "255 0 0 255")
+    assert_eq(pixel(paletted(), 2, 0), "0 255 0 255")
+    assert_eq(pixel(paletted(), 3, 0), "0 0 255 255")
+    assert_eq(pixel(paletted(), 3, 3), "0 255 0 255")
+    assert_eq(pixel(rgba(), 0, 0), "255 0 0 0")
+    assert_eq(pixel(rgba(), 1, 0), "0 255 0 85")
+    assert_eq(pixel(rgba(), 0, 1), "0 0 255 170")
+    assert_eq(pixel(rgba(), 1, 1), "255 255 255 255")
+    assert_eq(pixel(grayalpha(), 1, 0), "85 85 85 170")
+    assert_eq(pixel(grayalpha(), 1, 1), "255 255 255 0")
+    assert_eq(pixel(stored(), 0, 0), "0 0 0 255")
+    assert_eq(pixel(stored(), 5, 0), "80 80 80 255")
+end the_pixels_underneath
+
+@test
+every_row_filter_is_undone()
+    assert_eq(pixel(filtered(), 0, 0), "0 7 14 255")
+    assert_eq(pixel(filtered(), 3, 1), "21 28 35 255")
+    assert_eq(pixel(filtered(), 0, 2), "24 31 38 255")
+    assert_eq(pixel(filtered(), 2, 3), "42 49 56 255")
+    assert_eq(pixel(filtered(), 3, 4), "57 64 71 255")
+end every_row_filter_is_undone
+
+// Every sample of the five-row image, against the arithmetic that generated it. One assertion rather
+// than sixty, because sixty checks of the same shape say nothing sixty times.
+@test
+every_sample_of_all_five_rows()
+    var src: [256]u8
+    var n = unhex(filtered(), src)
+    var img = decode(src[..<n]).unwrap()
+    var wrong = 0
+
+    for y in 0..<img.height
+        for x in 0..<img.width
+            var p = img.at(x, y)
+            var base = int(y * 4 + x) * 3
+
+            if int(p.r) != base || int(p.g) != base + 7 || int(p.b) != base + 14 then wrong += 1
+
+    assert_eq(wrong, 0)
+end every_sample_of_all_five_rows
+
+// An image small enough to print, which is the most direct check there is: if a filter were undone
+// wrongly, or a row read at the wrong offset, the picture would say so.
+@test
+a_picture_as_the_surest_check_of_all()
+    var src: [256]u8
+    var n = unhex(checker(), src)
+    var img = decode(src[..<n]).unwrap()
+    var out = ""
+    var want = ""
+
+    for y in 0..<img.height
+        for x in 0..<img.width
+            out += if img.at(x, y).r > 127 then "#" else "."
+
+        out += "\n"
+
+    for y in 0..<8
+        want += if y % 2 == 0 then "#.#.#.#.\n" else ".#.#.#.#\n"
+
+    assert_eq(out, want)
+end a_picture_as_the_surest_check_of_all
+
+// ---------------------------------------------------------------------------------------- chunks
+
+// A chunk given a different name, its checksum recomputed to match. The case of the first letter is
+// the only difference between a chunk a reader may skip and one it may not.
+private renamed(file: string, at: usize, name: string) -> string
+    var src: [256]u8
+    var n = unhex(file, src)
+
+    for i in 0..<4usize
+        src[at + 4 + i] = name[i]
+
+    reseal(src, at)
+
+    decode(src[..<n]) match
+        Err(f) -> s"error: ${describe(f)}"
+        Ok(img) -> f"${img.width}%dx${img.height}%d type ${img.kind}%d"
+end renamed
+
+@test
+the_chunks_around_the_image()
+    assert_eq(headed(extra()), "2x2 type 2")
+    assert_eq(pixel(extra(), 1, 1), "255 255 0 255")
+    assert_eq(headed(split()), "2x2 type 2")
+    assert_eq(pixel(split(), 0, 1), "0 0 255 255")
+    assert_eq(renamed(extra(), 33, "ZZZZ"), "error: a chunk named 'ZZZZ' that must be understood and is not")
+    assert_eq(renamed(extra(), 33, "zZZZ"), "2x2 type 2")
+end the_chunks_around_the_image
+
+// ------------------------------------------------------------------------- files it refuses
+
+// One byte changed and nothing else, so the checksum notices.
+private scratched(file: string, at: usize, value: u8) -> string
+    var src: [256]u8
+    var n = unhex(file, src)
+
+    src[at] = value
+
+    decode(src[..<n]) match
+        Err(f) -> s"error: ${describe(f)}"
+        Ok(img) -> "decoded"
+end scratched
+
+// One byte changed and the checksum put back, so the reader has to be the one that objects.
+private edited(file: string, at: usize, value: u8) -> string
+    var src: [256]u8
+    var n = unhex(file, src)
+
+    src[at] = value
+    reseal(src, 8)
+
+    decode(src[..<n]) match
+        Err(f) -> s"error: ${describe(f)}"
+        Ok(img) -> "decoded"
+end edited
+
+private cut(file: string, keep: usize) -> string
+    var src: [256]u8
+
+    unhex(file, src)
+
+    decode(src[..<keep]) match
+        Err(f) -> s"error: ${describe(f)}"
+        Ok(img) -> "decoded"
+end cut
+
+// A byte of the compressed pixel data changed, its chunk resealed. Nothing in the container layer
+// can object, so whatever objects does so from inside the deflate stream.
+private spoiled(file: string, chunk: usize, at: usize, value: u8) -> string
+    var src: [256]u8
+    var n = unhex(file, src)
+
+    src[at] = value
+    reseal(src, chunk)
+
+    decode(src[..<n]) match
+        Err(f) -> s"error: ${describe(f)}"
+        Ok(img) -> "decoded"
+end spoiled
+
+private broken(file: string) -> string
+    var src: [256]u8
+    var n = unhex(file, src)
+
+    decode(src[..<n]) match
+        Err(f) -> s"error: ${describe(f)}"
+        Ok(img) -> "decoded"
+end broken
+
+@test
+a_file_that_is_not_one()
+    assert_eq(scratched(rgb(), 1, 0x00), "error: not a PNG at all")
+    assert_eq(scratched(rgb(), 19, 0x03), "error: the chunk at 8 does not match its checksum")
+    assert_eq(cut(rgb(), 40), "error: the file ends inside the chunk at 33")
+    assert_eq(cut(rgb(), 65), "error: the last chunk is not the end chunk")
+end a_file_that_is_not_one
+
+@test
+a_header_this_reader_will_not_take()
+    assert_eq(edited(rgb(), 24, 16), "error: 16 bits a sample, and this reader knows only 8")
+    assert_eq(edited(rgb(), 25, 5), "error: colour type 5 is not one of the five")
+    assert_eq(edited(rgb(), 26, 1), "error: compressed by something other than deflate")
+    assert_eq(edited(rgb(), 27, 1), "error: filtered by a method this format does not have")
+    assert_eq(edited(rgb(), 28, 1), "error: interlaced, and this reader reads rows in order")
+    assert_eq(edited(rgb(), 19, 0), "error: an image with no pixels in it")
+    assert_eq(edited(rgb(), 23, 3), "error: the rows need 21 bytes and the data unpacks to 14")
+end a_header_this_reader_will_not_take
+
+@test
+a_chunk_in_the_wrong_place_or_missing()
+    assert_eq(renamed(rgb(), 8, "iHDR"), "error: the header is not the first chunk")
+    assert_eq(renamed(extra(), 33, "IHDR"), "error: the header is not the first chunk")
+    assert_eq(renamed(rgb(), 33, "zdat"), "error: no image data")
+    assert_eq(renamed(paletted(), 33, "pLTE"), "error: a paletted image with no palette")
+end a_chunk_in_the_wrong_place_or_missing
+
+@test
+pixels_that_do_not_reconstruct()
+    assert_eq(broken(badfilter()), "error: row 0 claims filter 5")
+    assert_eq(spoiled(rgb(), 33, 45, 0x00), "error: the checksum says 1eef04fc and the bytes say 00f200f1")
+    assert_eq(spoiled(rgb(), 33, 44, 0x00),
+        "error: a match reaching 6530 bytes back, before anything was written")
+end pixels_that_do_not_reconstruct
+
+// ------------------------------------------------------------------- the table, and the renderings
+
+// A table held and used twice must answer what the one-shot answers, or the convenience form and the
+// form `decode` actually uses have drifted apart — which nothing else here would notice, since every
+// other check goes through one of them and not both.
+@test
+a_held_table_answers_what_the_one_shot_does()
+    var t = crc32_table()
+
+    assert_eq(t.of("abc".bytes), crc32("abc".bytes))
+    assert_eq(t.of("The quick brown fox jumps over the lazy dog".bytes),
+        crc32("The quick brown fox jumps over the lazy dog".bytes))
+
+    // The same table again, because a table that had been consumed rather than read would pass the
+    // two above and fail here.
+    assert_eq(f"${t.of("a".bytes)}%08x", "e8b7be43")
+end a_held_table_answers_what_the_one_shot_does
+
+@test
+a_fault_renders_as_what_it_says()
+    assert_eq(s"${NotPng}", describe(NotPng))
+    assert_eq(s"${BadDepth(16)}", "16 bits a sample, and this reader knows only 8")
+    assert_eq(s"${inflate.BadBlock}", inflate.describe(inflate.BadBlock))
+end a_fault_renders_as_what_it_says

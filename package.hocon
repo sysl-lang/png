@@ -1,0 +1,35 @@
+// A PNG reader for sysl, and the DEFLATE decoder underneath it.
+//
+// A file goes in as bytes and an `Image` comes out, with the chunk layer, both checksums, the
+// deflate stream and the row filters done on the way. All five colour types are read at eight bits
+// a sample, and `at(x, y)` answers an `Rgba` whichever of them the file used.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       png { git = "github.com/sysl-lang/png", version = "0.1.0" }
+//     }
+//
+// The coordinate names the package, `png`; the modules a program imports are `sh.sysl.png` and,
+// where raw DEFLATE is what is wanted and pictures are not, `sh.sysl.png.inflate`.
+
+package {
+  name    = "png"
+  version = "0.1.0"
+
+  // **The oldest compiler this builds with.** Nothing here reaches for a recent feature on purpose;
+  // what fixes the floor is the storage form the decoder's intermediate buffers take -- a `[]T`
+  // declared with a length computed while running, which is what lets `decode` size its own working
+  // storage from a header it has just read rather than making the caller guess and be told `NoRoom`.
+  sysl = "0.0.80"
+}
+
+// **`heap = true`, and it is the intermediate storage rather than the image.** `decode` gathers the
+// `IDAT` chunks into one buffer and unpacks them into another, and neither length is known until the
+// header has been read -- which happens inside. The `Image` that comes out owns the unpacked rows.
+//
+// **What is NOT here is `os` or `posix`.** This package opens nothing: a caller hands over bytes it
+// already has, and where they came from is the program's business.
+requires {
+  heap = true
+}
