@@ -7,7 +7,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       png { git = "github.com/sysl-lang/png", version = "0.1.0" }
+//       png { git = "github.com/sysl-lang/png", version = "0.1.1" }
 //     }
 //
 // The coordinate names the package, `png`; the modules a program imports are `sh.sysl.png` and,
@@ -15,13 +15,13 @@
 
 package {
   name    = "png"
-  version = "0.1.0"
+  version = "0.1.1"
 
-  // **The oldest compiler this builds with.** Nothing here reaches for a recent feature on purpose;
-  // what fixes the floor is the storage form the decoder's intermediate buffers take -- a `[]T`
-  // declared with a length computed while running, which is what lets `decode` size its own working
-  // storage from a header it has just read rather than making the caller guess and be told `NoRoom`.
-  sysl = "0.0.80"
+  // **The oldest compiler this builds with.** `decode` sizes its intermediate buffers with a `[]T`
+  // declared with a length computed while running, from a header it has just read rather than making
+  // the caller guess and be told `NoRoom`; those buffers are `val`s, which relies on a `val`-bound
+  // slice being writable through.
+  sysl = "0.1.0-alpha.8"
 }
 
 // **`heap = true`, and it is the intermediate storage rather than the image.** `decode` gathers the

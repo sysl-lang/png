@@ -33,7 +33,7 @@ Name it in your project's `package.hocon` and `sysl build` fetches it:
 
 ```hocon
 dependencies {
-  png { git = "github.com/sysl-lang/png", version = "0.1.0" }
+  png { git = "github.com/sysl-lang/png", version = "0.1.1" }
 }
 ```
 

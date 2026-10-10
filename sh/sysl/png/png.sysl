@@ -148,7 +148,7 @@ private crc_entry(n: usize) -> u32
     var c = u32(n)
 
     for k in 0..<8
-        c = if c & 1u32 != 0u32 then c >> 1u32 ^ 0xEDB88320u32 else c >> 1u32
+        c = if c & 1 != 0 then c >> 1 ^ 0xEDB88320 else c >> 1
 
     c
 end crc_entry
@@ -171,12 +171,12 @@ struct Crc32
 
     /** The checksum of `data`, as every chunk of a PNG carries it. */
     of(self, data: []const u8) -> u32
-        var c = 0xFFFFFFFFu32
+        var c: u32 = 0xFFFFFFFF
 
         for x in data
             c = self.table[usize((c ^ u32(x)) & 255)] ^ c >> 8
 
-        c ^ 0xFFFFFFFFu32
+        c ^ 0xFFFFFFFF
     end of
 end Crc32
 
@@ -238,7 +238,7 @@ decode(src: []u8) -> Result[Image, Fault]
 
     if src.len < 8 then return Err(NotPng)
 
-    var zbuf: []u8 = [0; src.len]
+    val zbuf: []u8 = [0; src.len]
 
     // One table for the whole file rather than one per chunk, which is the whole reason `Crc32` is a
     // value and not something the module keeps.
@@ -307,7 +307,7 @@ decode(src: []u8) -> Result[Image, Fault]
     var channels = channels_of(kind)
     var stride = 1 + width * channels
     var need = stride * height
-    var raw: []u8 = [0; need]
+    val raw: []u8 = [0; need]
 
     inflate.zlib(zbuf[..<zn], raw) match
         Err(e) -> return Err(Squashed(e))
