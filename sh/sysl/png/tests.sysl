@@ -508,11 +508,16 @@ end a_file_that_is_not_one
 
 @test
 a_header_this_reader_will_not_take()
-    assert_eq(edited(rgb(), 24, 16), "error: 16 bits a sample, and this reader knows only 8")
+    assert_eq(edited(rgb(), 24, 4), "error: 4 bits a sample is not a depth colour type 2 has")
     assert_eq(edited(rgb(), 25, 5), "error: colour type 5 is not one of the five")
     assert_eq(edited(rgb(), 26, 1), "error: compressed by something other than deflate")
     assert_eq(edited(rgb(), 27, 1), "error: filtered by a method this format does not have")
-    assert_eq(edited(rgb(), 28, 1), "error: interlaced, and this reader reads rows in order")
+    assert_eq(edited(rgb(), 28, 2), "error: interlace method 2 is not one the format has")
+
+    // A legal header whose data was written for another: sixteen bits a sample, or interlaced, need
+    // a different number of bytes than eight-bit rows in order unpack to.
+    assert_eq(edited(rgb(), 24, 16), "error: the rows need 26 bytes and the data unpacks to 14")
+    assert_eq(edited(rgb(), 28, 1), "error: the rows need 15 bytes and the data unpacks to 14")
     assert_eq(edited(rgb(), 19, 0), "error: an image with no pixels in it")
     assert_eq(edited(rgb(), 23, 3), "error: the rows need 21 bytes and the data unpacks to 14")
 end a_header_this_reader_will_not_take
@@ -554,6 +559,6 @@ end a_held_table_answers_what_the_one_shot_does
 @test
 a_fault_renders_as_what_it_says()
     assert_eq(s"${NotPng}", describe(NotPng))
-    assert_eq(s"${BadDepth(16)}", "16 bits a sample, and this reader knows only 8")
+    assert_eq(s"${BadDepth(16, 3)}", "16 bits a sample is not a depth colour type 3 has")
     assert_eq(s"${inflate.BadBlock}", inflate.describe(inflate.BadBlock))
 end a_fault_renders_as_what_it_says

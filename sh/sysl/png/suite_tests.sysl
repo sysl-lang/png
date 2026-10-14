@@ -1,0 +1,168 @@
+module sh.sysl.png
+
+@tests
+
+/** PngSuite, the format's conformance images, against stb_image.
+ *
+ * `testdata/pngsuite/` holds Willem van Schaik's suite as published (the README says where from,
+ * and its SHA-256): 162 images that are valid — every colour type at every depth, interlaced and
+ * not, odd sizes, every filter, transparency, gamma, text, chunk orderings and compression levels —
+ * and 14 whose names begin with `x`, each broken one particular way.
+ *
+ * **Every valid image is held against stb_image, pixel by pixel, at sixteen bits and at eight**: a
+ * decoder written by somebody else, from the same specification, with its own idea of how a palette
+ * or a transparent colour or a two-bit sample comes out as RGBA. Every broken one is refused with
+ * the exact sentence its breakage deserves.
+ */
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, read_bytes}
+import sysl.text.Search
+import sh.sysl.stb
+
+// The suite's directory, found from this file's own place in the tree.
+private[png] suite_dir() -> string
+    val here = __FILE__
+    val cut = here.last_index_of("/sh/sysl/png/").expect("this file sits under sh/sysl/png")
+
+    s"${here[0..<cut]}/testdata/pngsuite"
+end suite_dir
+
+private[png] suite(valid: bool) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in entries(suite_dir()).unwrap()
+        if name.ends_with(".png") && name.starts_with("x") != valid then out.push(name)
+
+    out
+end suite
+
+private[png] bytes_of(name: string) -> []u8 = read_bytes(s"${suite_dir()}/$name").unwrap()
+
+// Where the first pixel that differs from stb's is, or "" when none does.
+private against_stb(name: string) -> string
+    val src = bytes_of(name)
+    val img = decode(src) match
+        Ok(i) -> i
+        Err(e) -> return s"$name: $e"
+
+    val wide = stb.decode_16(src, stb.Channels.Rgba).unwrap()
+    val narrow = stb.decode(src, stb.Channels.Rgba).unwrap()
+    val w16 = wide.pixels()
+    val w8 = narrow.pixels()
+
+    if usize(wide.width) != img.width || usize(wide.height) != img.height then return s"$name: size"
+
+    for y in 0..<img.height
+        for x in 0..<img.width
+            val i = 4 * (y * img.width + x)
+            val p = img.at16(x, y)
+            val q = img.at(x, y)
+
+            if p.r != w16[i] || p.g != w16[i + 1] || p.b != w16[i + 2] || p.a != w16[i + 3]
+                return f"$name: ($x%d, $y%d) is ${p.r}%d ${p.g}%d ${p.b}%d ${p.a}%d and stb says ${w16[i]}%d ${w16[i + 1]}%d ${w16[i + 2]}%d ${w16[i + 3]}%d"
+
+            if q.r != w8[i] || q.g != w8[i + 1] || q.b != w8[i + 2] || q.a != w8[i + 3]
+                return f"$name: ($x%d, $y%d) at eight bits differs"
+
+    ""
+end against_stb
+
+@test("every valid PngSuite image decodes to the pixels stb_image makes of it, at 16 bits and at 8")
+pngsuite_matches_stb()
+    var checked = 0
+
+    for name in suite(true)
+        val why = against_stb(name)
+
+        assert(why == "", why)
+        checked += 1
+
+    assert_eq(checked, 162)
+end pngsuite_matches_stb
+
+@test("every broken PngSuite image is refused, each with what is wrong with it")
+pngsuite_refusals()
+    val want = [
+        ("xc1n0g08.png", "colour type 1 is not one of the five"),
+        ("xc9n2c08.png", "colour type 9 is not one of the five"),
+        ("xcrn0g04.png", "not a PNG at all"),
+        ("xcsn0g01.png", "the chunk at 49 does not match its checksum"),
+        ("xd0n2c08.png", "0 bits a sample is not a depth colour type 2 has"),
+        ("xd3n2c08.png", "3 bits a sample is not a depth colour type 2 has"),
+        ("xd9n2c08.png", "99 bits a sample is not a depth colour type 2 has"),
+        ("xdtn0g01.png", "no image data"),
+        ("xhdn0g08.png", "the chunk at 8 does not match its checksum"),
+        ("xlfn0g04.png", "not a PNG at all"),
+        ("xs1n0g01.png", "not a PNG at all"),
+        ("xs2n0g01.png", "not a PNG at all"),
+        ("xs4n0g01.png", "not a PNG at all"),
+        ("xs7n0g01.png", "not a PNG at all"),
+    ]
+
+    assert_eq(suite(false).len(), want.len)
+
+    for (name, why) in want
+        decode(bytes_of(name)) match
+            Ok(_) -> assert(false, s"$name decoded")
+            Err(e) -> assert_eq(s"$name: $e", s"$name: $why")
+end pngsuite_refusals
+
+@test("the suite's ancillary chunks read as the suite's README says they hold")
+pngsuite_ancillaries()
+    // Gamma: g03n0g16 is a gamma of 0.35, g25n2c08 of 2.5.
+    assert_eq(decode(bytes_of("g03n0g16.png")).unwrap().info.gamma.unwrap(), 35000)
+    assert_eq(decode(bytes_of("g25n2c08.png")).unwrap().info.gamma.unwrap(), 250000)
+
+    // Physical size: cdfn2c08 is 1 x 4 pixels per unit with no unit, cdun2c08 1,000 a metre.
+    val f = decode(bytes_of("cdfn2c08.png")).unwrap().info.phys.unwrap()
+
+    assert_eq(f.x, 1)
+    assert_eq(f.y, 4)
+    assert(!f.metre, "no unit")
+
+    val m = decode(bytes_of("cdun2c08.png")).unwrap().info.phys.unwrap()
+
+    assert_eq(m.x, 1000)
+    assert(m.metre, "a metre")
+
+    // Text: ct1n0g04 has six tEXt chunks; ctzn0g04 has two tEXt and four zTXt; cten0g04 iTXt in
+    // English; ctjn0g04 iTXt in Japanese.
+    val plain = decode(bytes_of("ct1n0g04.png")).unwrap().info.texts
+
+    assert_eq(plain.len(), 6)
+    assert_eq(plain[0].keyword, "Title")
+    assert_eq(plain[0].text, "PngSuite")
+    assert(!plain[0].international && !plain[0].compressed, "tEXt")
+
+    val zipped = decode(bytes_of("ctzn0g04.png")).unwrap().info.texts
+    var compressed = 0
+
+    for t in zipped
+        if t.compressed then compressed += 1
+
+    assert_eq(zipped.len(), 6)
+    assert_eq(compressed, 4)
+    assert_eq(zipped[2].keyword, "Copyright")
+    assert(zipped[2].text.starts_with("Copyright"), zipped[2].text)
+
+    val en = decode(bytes_of("cten0g04.png")).unwrap().info.texts
+
+    assert(en.len() > 0, "iTXt read")
+    assert(en[0].international, "iTXt")
+    assert_eq(en[0].language, "en")
+
+    val ja = decode(bytes_of("ctjn0g04.png")).unwrap().info.texts
+
+    assert(ja[0].international, "iTXt")
+    assert_eq(ja[0].language, "ja")
+
+    // Transparency: tbbn3p08 is paletted with a tRNS; tbrn2c08 truecolour keyed.
+    val pal = decode(bytes_of("tbbn3p08.png")).unwrap()
+
+    assert(pal.alpha.len > 0, "palette alpha")
+
+    val keyed = decode(bytes_of("tbrn2c08.png")).unwrap()
+
+    assert(keyed.keyed, "keyed colour")
+end pngsuite_ancillaries

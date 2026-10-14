@@ -1,0 +1,322 @@
+module sh.sysl.png.deflate
+
+@tests
+
+/** The compressor, checked against two inflaters that are not its own author's guess.
+ *
+ * Every stream goes back through `sh.sysl.png.inflate` in process, and the corpus also goes through
+ * **zlib itself** — python3's `zlib` module, which is the C library — in one child process that
+ * decompresses every file, compares it with what went in, and compresses the input at the same level
+ * so the sizes can be held against zlib's. The suite needs `python3` on the path for that test.
+ */
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, write_bytes, remove_dir_all}
+import sysl.process.capture
+import sysl.text.{Search, split}
+import sh.sysl.png.inflate
+
+// A deterministic stream of numbers: xorshift, so a failing case is the same case on every run.
+private struct Rng
+    s: u64
+
+    next(*self) -> u64
+        var x = self.s
+
+        x ^= x << 13
+        x ^= x >> 7
+        x ^= x << 17
+        self.s = x
+        x
+    end next
+
+    below(*self, n: usize) -> usize = usize(self.next() % u64(n))
+
+// Text with the statistics of text: words from a small vocabulary, so it has the repeats a matcher
+// finds and the skewed byte counts a dynamic code exploits.
+private text(n: usize, seed: u64) -> Buf[u8]
+    val words = ["the ", "pixels ", "of ", "a ", "deflate ", "stream ", "compress ", "and ",
+                 "window ", "match ", "huffman ", "block ", "zlib ", "png ", "filter ", "row\n"]
+    var r = Rng(seed)
+    var out: Buf[u8] = buf()
+
+    while out.len() < n
+        val w = words[r.below(16)]
+
+        for k in 0..<w.len
+            if out.len() < n then out.push(w[k])
+
+    out
+end text
+
+private noise(n: usize, seed: u64) -> Buf[u8]
+    var r = Rng(seed)
+    var out: Buf[u8] = buf()
+
+    for k in 0..<n
+        out.push(u8(r.next() >> 24 & 255))
+
+    out
+
+private same(n: usize, b: u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for k in 0..<n
+        out.push(b)
+
+    out
+
+// Runs of every length around the limits a match has, with noise between them: a run of 258 is one
+// whole match, 259 is a match and a literal, and so on.
+private runs(seed: u64) -> Buf[u8]
+    var r = Rng(seed)
+    var out: Buf[u8] = buf()
+
+    for len in [1, 2, 3, 4, 257, 258, 259, 260, 516, 517, 5000, 40000]
+        val b = u8(r.next() & 255)
+
+        for k in 0..<len
+            out.push(b)
+
+        for k in 0..<r.below(20)
+            out.push(u8(r.next() & 255))
+
+    out
+end runs
+
+// A picture's worth of filtered rows: a smooth gradient with a little noise, which is what a PNG
+// hands the compressor.
+private picture(seed: u64) -> Buf[u8]
+    var r = Rng(seed)
+    var out: Buf[u8] = buf()
+
+    for y in 0..<200usize
+        out.push(1)
+
+        for x in 0..<600usize
+            out.push(u8((x + y + r.below(4)) & 255))
+
+    out
+end picture
+
+private struct Case
+    name: string
+    data: Buf[u8]
+
+private corpus() -> Buf[Case]
+    var cs: Buf[Case] = buf()
+
+    cs.push(Case("empty", buf()))
+    cs.push(Case("one", same(1, 65)))
+    cs.push(Case("text", text(100000, 1)))
+    cs.push(Case("noise", noise(50000, 2)))
+    cs.push(Case("zeros", same(200000, 0)))
+    cs.push(Case("w32k", text(32768, 3)))
+    cs.push(Case("w32k1", text(32769, 4)))
+    cs.push(Case("w64k", noise(65536, 5)))
+    cs.push(Case("w64k1", text(65537, 6)))
+    cs.push(Case("runs", runs(7)))
+    cs.push(Case("picture", picture(8)))
+    cs
+end corpus
+
+// What our own inflater makes of a zlib stream, given exactly the room the original needs.
+private back(z: []const u8, n: usize) -> Result[Buf[u8], inflate.Fault]
+    var room: []u8 = [0; n + 1]
+    val got = inflate.zlib(z, room)?
+    var out: Buf[u8] = buf()
+
+    out.extend(room[..<got])
+    Ok(out)
+end back
+
+@test("every corpus file at every level and every block kind comes back through our own inflater")
+every_level_round_trips()
+    for c in corpus()
+        for level in 0..9
+            for blocks in [Blocks.Smallest, Blocks.Fixed, Blocks.Dynamic]
+                val z = zlib(c.data.view(), level, blocks)
+
+                back(z.view(), c.data.len()) match
+                    Ok(b) -> assert(b.view() == c.data.view(), s"${c.name} at level $level")
+                    Err(e) -> assert(false, s"${c.name} at level $level: $e")
+end every_level_round_trips
+
+@test("a bare stream is the zlib one without its six bytes of wrapper")
+a_bare_stream_is_the_wrapped_one_unwrapped()
+    val data = text(5000, 9)
+    val z = zlib(data.view(), 6)
+    val d = compress(data.view(), 6)
+
+    assert_eq(d.len() + 6, z.len())
+    assert(d.view() == z.view()[2..<z.len() - 4], "the same deflate stream inside")
+
+    var room: []u8 = [0; 5000]
+
+    assert_eq(inflate.raw(d.view(), room).unwrap(), 5000)
+    assert(room[..] == data.view(), "and it inflates bare")
+end a_bare_stream_is_the_wrapped_one_unwrapped
+
+@test("the header bytes say deflate, a 32 KB window, and how hard the compressor tried")
+the_header_bytes()
+    assert_eq(zlib([], 0)[1], 0x01)
+    assert_eq(zlib([], 1)[1], 0x01)
+    assert_eq(zlib([], 5)[1], 0x5e)
+    assert_eq(zlib([], 6)[1], 0x9c)
+    assert_eq(zlib([], 9)[1], 0xda)
+    assert_eq(zlib([], 9)[0], 0x78)
+
+    // Levels past either end are the nearer end.
+    assert(zlib(text(3000, 1).view(), 42).view() == zlib(text(3000, 1).view(), 9).view(), "42 is 9")
+    assert(zlib(text(3000, 1).view(), -3).view() == zlib(text(3000, 1).view(), 0).view(), "-3 is 0")
+end the_header_bytes
+
+@test("an empty input is one empty final block, and level 0 stores it")
+the_smallest_streams()
+    // A fixed block holding only its end: three header bits and seven of code, padded to two bytes.
+    assert(compress([], 6).view() == [u8(3), 0][..], "fixed, empty")
+    assert(compress([], 0).view() == [u8(1), 0, 0, 0xff, 0xff][..], "stored, empty")
+    assert(compress([u8(97)], 0).view() == [u8(1), 1, 0, 0xfe, 0xff, 97][..], "stored, one byte")
+end the_smallest_streams
+
+@test("level 0 splits a long input into stored blocks of at most 65,535 bytes")
+stored_blocks_split()
+    val data = noise(140000, 3)
+    val z = compress(data.view(), 0)
+
+    // Three blocks: two full and the rest, five bytes of header each.
+    assert_eq(z.len(), 140000 + 15)
+    assert_eq(z[0], 0)
+    assert_eq(z[65540], 0)
+    assert_eq(z[131080], 1)
+end stored_blocks_split
+
+// A match is at most 258 bytes, so 100,000 of one byte is at least 388 of them: about two bits each
+// once the block has its own code, which is what zlib makes of it too.
+@test("matches are found: a long run shrinks a hundredfold at every level above 0")
+runs_collapse()
+    for level in 1..9
+        assert(zlib(same(100000, 7).view(), level).len() < 1000, s"level $level")
+end runs_collapse
+
+@test("a higher level never does worse than level 1 on text, and level 9 beats it")
+levels_order()
+    val data = text(200000, 11)
+    val one = zlib(data.view(), 1).len()
+    val nine = zlib(data.view(), 9).len()
+
+    for level in 2..9
+        assert(zlib(data.view(), level).len() <= one, s"level $level")
+
+    assert(nine < one, "level 9 is smaller")
+end levels_order
+
+@test("five hundred random inputs come back through our inflater, at random levels")
+fuzz_round_trip()
+    var r = Rng(0x5eed)
+
+    for case in 0..<500
+        val n = r.below(3000)
+        var data: Buf[u8] = buf()
+        val alphabet = 1 + r.below(255)
+
+        // Mostly a small alphabet, with copies of earlier stretches spliced in, so every distance
+        // and length code is exercised and not only literals.
+        while data.len() < n
+            if data.len() > 10 && r.below(3) == 0
+                val from = r.below(data.len())
+                val len = 1 + r.below(300)
+
+                for k in 0..<len
+                    if from + k < data.len() then data.push(data[from + k])
+            else
+                data.push(u8(r.below(alphabet)))
+
+        val level = int(r.below(10))
+        val z = zlib(data.view(), level)
+
+        back(z.view(), data.len()) match
+            Ok(b) -> assert(b.view() == data.view(), s"case $case")
+            Err(e) -> assert(false, s"case $case: $e")
+end fuzz_round_trip
+
+// The check zlib makes of every stream, and the comparison of sizes: one child, every file.
+private val zlib_check: string = """
+import sys, zlib, os
+d = sys.argv[1]
+n = 0
+worst = 0.0
+where = ''
+for f in sorted(os.listdir(d)):
+    if not f.endswith('.z'):
+        continue
+    name, level, mode, _ = f.split('.')
+    src = open(os.path.join(d, name + '.in'), 'rb').read()
+    z = open(os.path.join(d, f), 'rb').read()
+    if zlib.decompress(z) != src:
+        print('bad', f)
+        sys.exit(1)
+    n += 1
+    if mode == 's' and int(level) > 0 and len(src) > 1000:
+        ratio = len(z) / len(zlib.compress(src, int(level)))
+        if ratio > worst:
+            worst, where = ratio, f
+print('ok', n, '%.3f' % worst, where)
+"""
+
+// The worst measured is 1.055 of zlib's size, a filtered picture at level 3 (zlib's levels 1 to 3 are
+// a different, faster loop than this one's); everything from level 4 up is within half a percent.
+@test("zlib itself inflates every stream to what went in, and our sizes are within 10% of its own")
+zlib_agrees()
+    val dir = make_temp_dir("png-deflate").unwrap()
+    var files = 0
+
+    for c in corpus()
+        write_bytes(s"$dir/${c.name}.in", c.data.view()).unwrap()
+
+        for level in 0..9
+            write_bytes(s"$dir/${c.name}.$level.s.z", zlib(c.data.view(), level).view()).unwrap()
+            write_bytes(s"$dir/${c.name}.$level.f.z", zlib(c.data.view(), level, Blocks.Fixed).view()).unwrap()
+            write_bytes(s"$dir/${c.name}.$level.d.z", zlib(c.data.view(), level, Blocks.Dynamic).view()).unwrap()
+            files += 3
+
+    val out = capture("python3", ["-c", zlib_check, dir]).unwrap()
+
+    print(out.text)
+
+    val words = split(out.text.trim(), " ")
+
+    assert_eq(words[0], "ok")
+    assert_eq(words[1], str(files))
+    assert(words[2] <= "1.100",s"worst ratio ${words[2]} in ${words[3]}")
+    remove_dir_all(dir).unwrap()
+end zlib_agrees
+
+@test("code lengths never pass the limit, and fill the tree exactly, however skewed the counts")
+lengths_are_limited()
+    // Fibonacci counts are the worst case: an unlimited code over n of them is n - 1 deep.
+    var freq: [30]u32
+    var a: u32 = 1
+    var b: u32 = 1
+
+    for k in 0..<30usize
+        freq[k] = a
+
+        val c = a + b
+
+        a = b
+        b = c
+
+    for limit in [7u32, 9, 15]
+        var lens: [30]u8
+
+        lengths(freq, limit, lens)
+
+        var kraft: u64 = 0
+
+        for l in lens
+            assert(l >= 1 && u32(l) <= limit, s"a length of $l under limit $limit")
+            kraft += u64(1) << u64(limit - u32(l))
+
+        assert_eq(kraft, u64(1) << u64(limit))
+end lengths_are_limited

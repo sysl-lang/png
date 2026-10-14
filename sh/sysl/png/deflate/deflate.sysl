@@ -1,0 +1,846 @@
+/** A DEFLATE compressor, and the zlib wrapper PNG keeps its pixels in.
+ *
+ * The other half of `sh.sysl.png.inflate`, and usable without it or without pictures: bytes go in, a
+ * stream any inflater reads comes out. Three things happen on the way.
+ *
+ * - **Matching.** Every position is hashed by its next three bytes into a chain of the earlier
+ *   positions that began the same way, and the chain is walked for the longest earlier copy within
+ *   the 32 KB window. From level 4 up the match is *lazy*: before taking a match, the next position
+ *   is tried too, and a longer match there wins, the first byte going out as a literal.
+ * - **Coding.** The literals and matches of a block are counted and given a Huffman code of their
+ *   own, limited to the 15 bits the format allows; the code's own lengths are run-length coded and
+ *   given a code of their own, limited to 7.
+ * - **Choosing.** Each block is costed three ways — stored, under the fixed code the format defines,
+ *   and under its own dynamic code — and goes out the cheapest way.
+ *
+ * Levels run 0 to 9 and mean roughly what zlib's do: 0 stores, 1 to 3 match greedily with short
+ * chains, 4 to 9 match lazily with chains that grow to 4,096 links at 9. A level outside 0 to 9 is
+ * taken as the nearer end.
+ */
+module sh.sysl.png.deflate
+
+import sysl.buf.{Buf, buf}
+import sh.sysl.png.inflate.adler32
+
+/** Which kind of block a compressor may write. `Smallest` costs each block every way and writes the
+ * cheapest; the other two force one kind, which is how each is tested on its own. Level 0 stores
+ * whatever this says, since storing is what level 0 means.
+ */
+enum Blocks
+    Smallest
+    Fixed
+    Dynamic
+
+const window: usize = 32768
+const wmask: usize = window - 1
+const hash_bits: u32 = 15
+const hash_size: usize = 1 << 15
+const min_match: usize = 3
+const max_match: usize = 258
+const block_symbols: usize = 16384
+const too_far: usize = 4096
+
+private val lbase: [29]usize = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27,
+    31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+]
+
+private val lextra: [29]u32 = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+    2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+]
+
+private val dbase: [30]usize = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129,
+    193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+]
+
+private val dextra: [30]u32 = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6,
+    6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+]
+
+private val order: [19]usize = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+// zlib's own table, so a level here searches about as hard as the same level there: a match this
+// long already (`good`) quarters the chain, one this long (`lazy`) is taken without looking one
+// further, one this long (`nice`) stops the search, and `chain` is how many links are followed.
+// Levels 1 to 3 are greedy, and there `lazy` is instead the longest match whose positions are
+// still entered in the hash chains.
+private val good_at: [10]usize = [0, 4, 4, 4, 4, 8, 8, 8, 32, 32]
+private val lazy_at: [10]usize = [0, 4, 5, 6, 4, 16, 16, 32, 128, 258]
+private val nice_at: [10]usize = [0, 8, 16, 32, 16, 32, 128, 128, 258, 258]
+private val chain_at: [10]usize = [0, 4, 8, 32, 16, 32, 128, 256, 1024, 4096]
+
+/** Compress `data` to a bare DEFLATE stream, with no wrapper and no checksum. */
+compress(data: []const u8, level: int = 6, blocks: Blocks = Blocks.Smallest) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    deflate_into(out, data, clamp(level), blocks)
+    out
+end compress
+
+/** Compress `data` to a zlib stream: a two-byte header, the DEFLATE stream, and the big-endian
+ * Adler-32 of `data`. This is what a PNG's `IDAT` chunks carry between them.
+ */
+zlib(data: []const u8, level: int = 6, blocks: Blocks = Blocks.Smallest) -> Buf[u8]
+    val lv = clamp(level)
+    var out: Buf[u8] = buf()
+
+    // `78` is deflate with a 32 KB window; the second byte records roughly how hard the compressor
+    // tried and is then made up so the pair, read big-endian, is a multiple of 31.
+    val flevel: u32 = if lv < 2 then 0 else if lv < 6 then 1 else if lv == 6 then 2 else 3
+    var flg = flevel << 6
+
+    flg += (31 - (0x78 * 256 + flg) % 31) % 31
+    out.push(0x78)
+    out.push(u8(flg))
+    deflate_into(out, data, lv, blocks)
+
+    val sum = adler32(data)
+
+    out.push(u8(sum >> 24))
+    out.push(u8(sum >> 16 & 255))
+    out.push(u8(sum >> 8 & 255))
+    out.push(u8(sum & 255))
+    out
+end zlib
+
+private clamp(level: int) -> usize = if level < 0 then 0 else if level > 9 then 9 else usize(level)
+
+private deflate_into(out: Buf[u8], data: []const u8, level: usize, blocks: Blocks)
+    var bits = Bits(out, 0, 0)
+
+    if level == 0
+        stored(&bits, data, 0, data.len, true)
+        bits.finish()
+        return
+
+    val head: []u32 = [0; hash_size]
+    val prev: []u32 = [0; window]
+    val lit: []u16 = [0; block_symbols]
+    val dst: []u16 = [0; block_symbols]
+    var d = Def(data, bits, blocks, head, prev, lit, dst, 0, 0, good_at[level], lazy_at[level],
+                nice_at[level], chain_at[level], 0, 0, tables())
+
+    if level < 4 then d.greedy() else d.lazy()
+
+    d.flush(true, data.len)
+    d.bits.finish()
+end deflate_into
+
+// Write `data[from..<to]` as stored blocks, as many as the 65,535-byte limit on one needs, the last
+// one marked final if `last`.
+private stored(bits: *Bits, data: []const u8, from: usize, to: usize, last: bool)
+    var at = from
+
+    loop
+        val n = if to - at > 65535 then 65535 else to - at
+        val final = last && at + n == to
+
+        bits.put(if final then 1 else 0, 1)
+        bits.put(0, 2)
+        bits.align()
+        bits.put(u32(n), 16)
+        bits.put(u32(n) ^ 0xFFFF, 16)
+        bits.drain()
+        bits.out.extend(data[at..<at + n])
+        at += n
+
+        if at == to then break
+end stored
+
+/** Bits going out least-significant first, which is the order DEFLATE packs everything but a Huffman
+ * code in — and a Huffman code goes in reversed, so the same `put` serves both.
+ *
+ * The accumulator is 64 bits and is emptied four bytes at a time once it holds 32, so a `put` of up
+ * to 32 bits never loses any: at most 31 are waiting when it starts.
+ */
+private struct Bits
+    out: Buf[u8]
+    acc: u64
+    n: u32
+
+    @inline
+    put(*self, v: u32, len: u32)
+        self.acc |= u64(v) << u64(self.n)
+        self.n += len
+
+        if self.n >= 32
+            val a = self.acc
+
+            self.out.push(u8(a & 255))
+            self.out.push(u8(a >> 8 & 255))
+            self.out.push(u8(a >> 16 & 255))
+            self.out.push(u8(a >> 24 & 255))
+            self.acc = a >> 32
+            self.n -= 32
+    end put
+
+    // Pad to a byte boundary with zero bits.
+    align(*self)
+        self.n = (self.n + 7) / 8 * 8
+
+    // Hand over every whole byte waiting, which after `align` is all of them.
+    drain(*self)
+        while self.n >= 8
+            self.out.push(u8(self.acc & 255))
+            self.acc >>= 8
+            self.n -= 8
+
+    finish(*self)
+        self.align()
+        self.drain()
+end Bits
+
+// The lookups a block writer makes for every match: a match length's code, and a distance's.
+private struct Tables
+    len_code: [259]u8
+    dist_code: [512]u8
+
+private tables() -> Tables
+    var t: Tables
+
+    for c in 0..<29usize
+        val top = if c == 28 then 259 else lbase[c] + (1 << usize(lextra[c]))
+
+        for l in lbase[c]..<top
+            t.len_code[l] = u8(c)
+
+    // Distances to 256 one by one; past that, the codes change only every 128, so the rest are
+    // looked up by the distance shifted down seven bits, which is zlib's arrangement.
+    for c in 0..<30usize
+        val top = dbase[c] + (1 << usize(dextra[c]))
+
+        for d in dbase[c]..<top
+            if d <= 256
+                t.dist_code[d - 1] = u8(c)
+            else
+                t.dist_code[256 + ((d - 1) >> 7)] = u8(c)
+
+    t
+end tables
+
+private dist_code(t: *Tables, d: usize) -> usize =
+    if d <= 256 then usize(t.dist_code[d - 1]) else usize(t.dist_code[256 + ((d - 1) >> 7)])
+
+// The three bytes at `i` hashed to fifteen bits.
+@inline
+private hash3(src: []const u8, i: usize) -> usize
+    val v = u32(src[i]) | u32(src[i + 1]) << 8 | u32(src[i + 2]) << 16
+
+    usize(v * 2654435761 >> (32 - hash_bits))
+
+/** The compressor's state across one stream: the hash chains over the input, and the symbols of the
+ * block being gathered.
+ *
+ * Chains hold a position plus one, so zero is "nobody", and `prev` is indexed by position modulo the
+ * window: the slot a position shares with one 32 KB earlier is the reason a match may reach back no
+ * further than 32,767 bytes here, since by then that slot belongs to somebody newer.
+ */
+private struct Def
+    src: []const u8
+    bits: Bits
+    blocks: Blocks
+    head: []u32
+    prev: []u32
+    lit: []u16
+    dst: []u16
+    count: usize
+    start: usize
+    good: usize
+    lazy_len: usize
+    nice: usize
+    chain: usize
+    mlen: usize
+    mdist: usize
+    t: Tables
+
+    // Enter position `i` in its chain, answering the chain as it stood: the latest earlier position
+    // whose three bytes hashed the same, plus one.
+    @inline
+    insert(*self, i: usize) -> u32
+        val h = hash3(self.src, i)
+        val first = self.head[h]
+
+        self.prev[i & wmask] = first
+        self.head[h] = u32(i + 1)
+        first
+    end insert
+
+    // Walk the chain from `first` for the longest match at `i` that beats `best`, leaving it in
+    // `mlen` and `mdist` (`mlen` zero if nothing beat it).
+    longest(*self, i: usize, first: u32, beat: usize)
+        val src = self.src
+        val prev = self.prev
+        val nice = self.nice
+        val most = if src.len - i < max_match then src.len - i else max_match
+        val limit = if i >= window then i - window + 1 else 0
+        var chain = if beat >= self.good then self.chain >> 2 else self.chain
+        var best = if beat < min_match - 1 then min_match - 1 else beat
+        var mlen: usize = 0
+        var mdist: usize = 0
+        var c = first
+
+        // The walk keeps everything in locals and writes the answer once: a store through `self`
+        // inside the loop would have every field read again after it.
+        while c != 0 && chain > 0 && best < most
+            val p = usize(c - 1)
+
+            if p < limit then break
+
+            if src[p + best] == src[i + best] && src[p] == src[i]
+                var k: usize = 1
+
+                while k < most && src[p + k] == src[i + k]
+                    k += 1
+
+                if k > best
+                    best = k
+                    mlen = k
+                    mdist = i - p
+
+                    if k >= nice then break
+
+            chain -= 1
+
+            val next = prev[p & wmask]
+
+            if next >= c then break
+
+            c = next
+
+        self.mlen = mlen
+        self.mdist = mdist
+    end longest
+
+    @inline
+    literal(*self, b: u8, end: usize)
+        self.lit[self.count] = u16(b)
+        self.dst[self.count] = 0
+        self.count += 1
+
+        if self.count == block_symbols then self.flush(false, end)
+
+    @inline
+    copy(*self, len: usize, dist: usize, end: usize)
+        self.lit[self.count] = u16(len)
+        self.dst[self.count] = u16(dist)
+        self.count += 1
+
+        if self.count == block_symbols then self.flush(false, end)
+
+    // Levels 1 to 3: take the longest match at each position, and enter the positions a match
+    // covers in the chains only when the match is short.
+    greedy(*self)
+        val n = self.src.len
+        var i: usize = 0
+
+        while i < n
+            self.mlen = 0
+
+            if i + min_match <= n
+                val first = self.insert(i)
+
+                if first != 0
+                    self.longest(i, first, 0)
+
+                    if self.mlen == min_match && self.mdist > too_far then self.mlen = 0
+
+            if self.mlen >= min_match
+                val len = self.mlen
+
+                self.copy(len, self.mdist, i + len)
+
+                if len <= self.lazy_len
+                    for j in i + 1..<i + len
+                        if j + min_match <= n then self.insert(j)
+
+                i += len
+            else
+                self.literal(self.src[i], i + 1)
+                i += 1
+    end greedy
+
+    // Levels 4 to 9: a match found at one position is held while the next is tried, and loses to a
+    // longer one there — the held position then goes out as a literal.
+    lazy(*self)
+        val n = self.src.len
+        var i: usize = 0
+        var held = false
+        var hlen: usize = 0
+        var hdist: usize = 0
+
+        while i < n
+            var first: u32 = 0
+
+            if i + min_match <= n then first = self.insert(i)
+
+            self.mlen = 0
+
+            if first != 0 && !(held && hlen >= self.lazy_len)
+                self.longest(i, first, if held then hlen else 0)
+
+                if self.mlen == min_match && self.mdist > too_far then self.mlen = 0
+
+            if held
+                if self.mlen > hlen
+                    self.literal(self.src[i - 1], i)
+                    hlen = self.mlen
+                    hdist = self.mdist
+                    i += 1
+                else
+                    val end = i - 1 + hlen
+
+                    self.copy(hlen, hdist, end)
+
+                    for j in i + 1..<end
+                        if j + min_match <= n then self.insert(j)
+
+                    i = end
+                    held = false
+            else if self.mlen >= min_match
+                held = true
+                hlen = self.mlen
+                hdist = self.mdist
+                i += 1
+            else
+                self.literal(self.src[i], i + 1)
+                i += 1
+
+        if held then self.copy(hlen, hdist, i - 1 + hlen)
+    end lazy
+
+    // Write the block gathered so far, which covers `src[start..<end]`, the cheapest way allowed.
+    flush(*self, last: bool, end: usize)
+        var lfreq: [286]u32
+        var dfreq: [30]u32
+        var extra: usize = 0
+
+        for k in 0..<self.count
+            val d = usize(self.dst[k])
+
+            if d == 0
+                lfreq[usize(self.lit[k])] += 1
+            else
+                val lc = usize(self.t.len_code[usize(self.lit[k])])
+                val dc = dist_code(&self.t, d)
+
+                lfreq[257 + lc] += 1
+                dfreq[dc] += 1
+                extra += usize(lextra[lc]) + usize(dextra[dc])
+
+        lfreq[256] = 1
+
+        // The fixed code's cost needs nothing built.
+        var fixed_cost = extra + 3
+
+        for s in 0..<286usize
+            fixed_cost += usize(lfreq[s]) * usize(fixed_len(s))
+
+        for s in 0..<30usize
+            fixed_cost += usize(dfreq[s]) * 5
+
+        val bytes = end - self.start
+        val stored_cost = (bytes / 65535 + 1) * 40 + bytes * 8
+
+        // The dynamic code, built whenever it might be used.
+        var dyn: Dynamic
+        var dynamic_cost: usize = 0
+
+        if self.blocks != Blocks.Fixed
+            dynamic_cost = dyn.build(lfreq, dfreq) + extra
+
+        var kind = 2
+
+        if self.blocks == Blocks.Fixed
+            kind = 1
+        else if self.blocks == Blocks.Smallest
+            if fixed_cost <= dynamic_cost then kind = 1
+            if stored_cost < fixed_cost && stored_cost < dynamic_cost then kind = 0
+
+        if kind == 0
+            stored(&self.bits, self.src, self.start, end, last)
+        else if kind == 1
+            var ll: [288]u8
+            var dl: [30]u8
+
+            for s in 0..<288usize
+                ll[s] = fixed_len(s)
+
+            for s in 0..<30usize
+                dl[s] = 5
+
+            var lc: [288]u16
+            var dc: [30]u16
+
+            canonical(ll, lc)
+            canonical(dl, dc)
+            self.bits.put(if last then 1 else 0, 1)
+            self.bits.put(1, 2)
+            self.symbols(ll, lc, dl, dc)
+        else
+            self.bits.put(if last then 1 else 0, 1)
+            self.bits.put(2, 2)
+            dyn.header(&self.bits)
+            self.symbols(dyn.ll, dyn.lc, dyn.dl, dyn.dc)
+
+        self.count = 0
+        self.start = end
+    end flush
+
+    // A block's symbols under the given code, and the end-of-block symbol.
+    symbols(*self, ll: []u8, lc: []u16, dl: []u8, dc: []u16)
+        for k in 0..<self.count
+            val d = usize(self.dst[k])
+            val v = usize(self.lit[k])
+
+            if d == 0
+                self.bits.put(u32(lc[v]), u32(ll[v]))
+            else
+                val c = usize(self.t.len_code[v])
+                val s = 257 + c
+                val e = dist_code(&self.t, d)
+
+                self.bits.put(u32(lc[s]), u32(ll[s]))
+
+                if lextra[c] > 0 then self.bits.put(u32(v - lbase[c]), lextra[c])
+
+                self.bits.put(u32(dc[e]), u32(dl[e]))
+
+                if dextra[e] > 0 then self.bits.put(u32(d - dbase[e]), dextra[e])
+
+        self.bits.put(u32(lc[256]), u32(ll[256]))
+    end symbols
+end Def
+
+private fixed_len(s: usize) -> u8 = if s < 144 then 8 else if s < 256 then 9 else if s < 280 then 7 else 8
+
+/** A block's own code: the lengths and codes of both alphabets, and the run-length coding of the
+ * lengths under the third code that the block header carries.
+ */
+private struct Dynamic
+    ll: [286]u8
+    lc: [286]u16
+    dl: [30]u8
+    dc: [30]u16
+    nlit: usize
+    ndist: usize
+    rle: [316]u8
+    rle_extra: [316]u8
+    nrle: usize
+    cl: [19]u8
+    cc: [19]u16
+    ncl: usize
+
+    // Build both codes from the counts and answer what the header and the symbols will cost in
+    // bits, extra bits aside.
+    build(*self, lfreq: []u32, dfreq: []u32) -> usize
+        var lf: [286]u32
+        var df: [30]u32
+
+        for s in 0..<286usize
+            lf[s] = lfreq[s]
+
+        for s in 0..<30usize
+            df[s] = dfreq[s]
+
+        // A code of one symbol is a code with an unused half, which some inflaters refuse; give each
+        // alphabet at least two symbols so both trees are complete.
+        pad_to_two(lf)
+        pad_to_two(df)
+        lengths(lf, 15, self.ll)
+        lengths(df, 15, self.dl)
+        canonical(self.ll, self.lc)
+        canonical(self.dl, self.dc)
+
+        self.nlit = 286
+
+        while self.nlit > 257 && self.ll[self.nlit - 1] == 0
+            self.nlit -= 1
+
+        self.ndist = 30
+
+        while self.ndist > 1 && self.dl[self.ndist - 1] == 0
+            self.ndist -= 1
+
+        // Run-length code the two length lists as one, which is how the format reads them.
+        var all: [316]u8
+
+        for s in 0..<self.nlit
+            all[s] = self.ll[s]
+
+        for s in 0..<self.ndist
+            all[self.nlit + s] = self.dl[s]
+
+        val total = self.nlit + self.ndist
+        var i: usize = 0
+
+        self.nrle = 0
+
+        while i < total
+            val v = all[i]
+            var run: usize = 1
+
+            while i + run < total && all[i + run] == v
+                run += 1
+
+            i += run
+
+            if v == 0
+                while run >= 11
+                    val r = if run > 138 then 138 else run
+
+                    self.run(18, r - 11)
+                    run -= r
+
+                if run >= 3
+                    self.run(17, run - 3)
+                    run = 0
+            else
+                self.run(v, 0)
+                run -= 1
+
+                while run >= 3
+                    val r = if run > 6 then 6 else run
+
+                    self.run(16, r - 3)
+                    run -= r
+
+            for k in 0..<run
+                self.run(v, 0)
+
+        var cf: [19]u32
+
+        for k in 0..<self.nrle
+            cf[usize(self.rle[k])] += 1
+
+        pad_to_two(cf)
+        lengths(cf, 7, self.cl)
+        canonical(self.cl, self.cc)
+
+        self.ncl = 19
+
+        while self.ncl > 4 && self.cl[order[self.ncl - 1]] == 0
+            self.ncl -= 1
+
+        var cost: usize = 3 + 14 + 3 * self.ncl
+
+        for k in 0..<self.nrle
+            val s = usize(self.rle[k])
+
+            cost += usize(self.cl[s]) + (if s == 16 then 2 else if s == 17 then 3 else if s == 18 then 7 else 0)
+
+        for s in 0..<286usize
+            cost += usize(lfreq[s]) * usize(self.ll[s])
+
+        for s in 0..<30usize
+            cost += usize(dfreq[s]) * usize(self.dl[s])
+
+        cost
+    end build
+
+    private run(*self, sym: u8, extra: usize)
+        self.rle[self.nrle] = sym
+        self.rle_extra[self.nrle] = u8(extra)
+        self.nrle += 1
+
+    header(*self, bits: *Bits)
+        bits.put(u32(self.nlit - 257), 5)
+        bits.put(u32(self.ndist - 1), 5)
+        bits.put(u32(self.ncl - 4), 4)
+
+        for k in 0..<self.ncl
+            bits.put(u32(self.cl[order[k]]), 3)
+
+        for k in 0..<self.nrle
+            val s = usize(self.rle[k])
+
+            bits.put(u32(self.cc[s]), u32(self.cl[s]))
+
+            if s == 16 then bits.put(u32(self.rle_extra[k]), 2)
+            if s == 17 then bits.put(u32(self.rle_extra[k]), 3)
+            if s == 18 then bits.put(u32(self.rle_extra[k]), 7)
+    end header
+end Dynamic
+
+private pad_to_two(freq: []u32)
+    var used: usize = 0
+
+    for f in freq
+        if f != 0 then used += 1
+
+    var k: usize = 0
+
+    while used < 2 && k < freq.len
+        if freq[k] == 0
+            freq[k] = 1
+            used += 1
+
+        k += 1
+end pad_to_two
+
+/** Huffman code lengths for `freq`, none longer than `limit`, written to `lens` (zero for a symbol
+ * that never occurs).
+ *
+ * The optimal lengths come first, by Moffat and Katajainen's in-place method over the symbols sorted
+ * by count. Where that wants a code longer than the limit, the counts of codes per length are
+ * repaired the way miniz does it: everything past the limit is pulled to it, and then, while the
+ * lengths over-fill the tree, one code at the limit is removed and one shorter code split into two
+ * a level deeper — each step removes exactly one unit of over-subscription, so it ends with the tree
+ * exactly full and nothing past the limit. The lengths are then dealt back out shortest first to the
+ * most frequent symbols.
+ */
+lengths(freq: []u32, limit: u32, lens: []u8)
+    val n = freq.len
+    var syms: [288]u16
+    var key: [288]u32
+    var m: usize = 0
+
+    for s in 0..<n
+        lens[s] = 0
+
+        if freq[s] != 0
+            // Insertion by count, keeping symbol order among equal counts.
+            var j = m
+
+            while j > 0 && key[j - 1] > freq[s]
+                key[j] = key[j - 1]
+                syms[j] = syms[j - 1]
+                j -= 1
+
+            key[j] = freq[s]
+            syms[j] = u16(s)
+            m += 1
+
+    if m == 0 then return
+
+    if m == 1
+        lens[usize(syms[0])] = 1
+        return
+
+    // Moffat-Katajainen: the first pass turns the counts into parent pointers, the second into
+    // depths of internal nodes, the third into the number of leaves at each depth.
+    key[0] += key[1]
+
+    var root: usize = 0
+    var leaf: usize = 2
+
+    for next in 1..<m - 1
+        if leaf >= m || key[root] < key[leaf]
+            key[next] = key[root]
+            key[root] = u32(next)
+            root += 1
+        else
+            key[next] = key[leaf]
+            leaf += 1
+
+        if leaf >= m || (root < next && key[root] < key[leaf])
+            key[next] += key[root]
+            key[root] = u32(next)
+            root += 1
+        else
+            key[next] += key[leaf]
+            leaf += 1
+
+    key[m - 2] = 0
+
+    var at = int(m) - 3
+
+    while at >= 0
+        key[at] = key[usize(key[at])] + 1
+        at -= 1
+
+    var avail = 1
+    var used = 0
+    var depth: u32 = 0
+    var r = int(m) - 2
+    var nx = int(m) - 1
+
+    while avail > 0
+        while r >= 0 && key[r] == depth
+            used += 1
+            r -= 1
+
+        while avail > used
+            key[nx] = depth
+            nx -= 1
+            avail -= 1
+
+        avail = 2 * used
+        depth += 1
+        used = 0
+
+    // `key[i]` is now the length for `syms[i]`; count them, capped into the slot past the limit.
+    var count: [33]u32
+
+    for i in 0..<m
+        val l = if key[i] > 32 then 32 else key[i]
+
+        count[l] += 1
+
+    for l in limit + 1..32
+        count[limit] += count[l]
+        count[l] = 0
+
+    var total: u32 = 0
+
+    for l in 1..limit
+        total += count[l] << (limit - l)
+
+    while total != 1 << limit
+        count[limit] -= 1
+
+        var l = limit - 1
+
+        while l > 0
+            if count[l] != 0
+                count[l] -= 1
+                count[l + 1] += 2
+                break
+
+            l -= 1
+
+        total -= 1
+
+    var j = m
+
+    for l in 1..limit
+        for k in 0..<count[l]
+            j -= 1
+            lens[usize(syms[j])] = u8(l)
+end lengths
+
+/** The canonical codes for a list of lengths, each bit-reversed to go out least-significant first. */
+canonical(lens: []u8, codes: []u16)
+    var count: [16]u32
+    var next: [16]u32
+
+    for l in lens
+        count[usize(l)] += 1
+
+    count[0] = 0
+
+    var code: u32 = 0
+
+    for l in 1..<16usize
+        code = (code + count[l - 1]) << 1
+        next[l] = code
+
+    for s in 0..<lens.len
+        val l = usize(lens[s])
+
+        if l != 0
+            var c = next[l]
+            var rev: u32 = 0
+
+            next[l] += 1
+
+            for k in 0..<l
+                rev = rev << 1 | c & 1
+                c >>= 1
+
+            codes[s] = u16(rev)
+        else
+            codes[s] = 0
+end canonical

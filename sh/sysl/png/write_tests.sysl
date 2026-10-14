@@ -1,0 +1,426 @@
+module sh.sysl.png
+
+@tests
+
+/** The writer, checked three ways that do not share its author's assumptions.
+ *
+ * - **Round trip**: what it writes, the reader reads back to the same samples, palette and
+ *   transparency, at every colour type and depth, interlaced and not, under every filter.
+ * - **stb_image**: an independent decoder reads every written file to the same RGBA the image itself
+ *   answers.
+ * - **`pngcheck -v`**: the reference checker passes every written file, chunk by chunk. The suite
+ *   needs `pngcheck` on the path for those tests.
+ */
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, write_bytes, remove_dir_all, read_bytes, entries}
+import sysl.process.capture
+import sysl.text.Search
+import sysl.encoding.get_u32_be
+import sh.sysl.png.inflate
+import sh.sysl.stb
+
+private struct Rng
+    s: u64
+
+    next(*self) -> u64
+        var x = self.s
+
+        x ^= x << 13
+        x ^= x >> 7
+        x ^= x << 17
+        self.s = x
+        x
+    end next
+
+// Store sample `c` of pixel `x` in row `row` of `data`.
+private set_sample(data: []u8, row: usize, x: usize, c: usize, channels: usize, depth: u8, v: u16)
+    val i = x * channels + c
+
+    if depth == 16
+        data[row + 2 * i] = u8(v >> 8)
+        data[row + 2 * i + 1] = u8(v & 255)
+    else if depth == 8
+        data[row + i] = u8(v)
+    else
+        put_bits(data, row, i, usize(depth), u8(v))
+
+// An image of every sample value the depth has, in an order no filter predicts exactly; a palette of
+// as many colours as the depth can name, and, if `clear`, transparency: alphas for half the palette,
+// or one key colour that occurs in the image.
+private synthetic(w: usize, h: usize, kind: u8, depth: u8, clear: bool, seed: u64) -> Image
+    var r = Rng(seed)
+    val ch = channels_of(kind)
+    val rb = row_bytes_of(w, kind, depth)
+    val data: []u8 = [0; h * rb]
+    val top = if depth == 16 then 65536 else 1 << usize(depth)
+
+    for y in 0..<h
+        for x in 0..<w
+            for c in 0..<ch
+                val v = if (x + y) % 3 == 0 then (x * 7 + y * 13 + c * 5) % top else usize(r.next() % u64(top))
+
+                set_sample(data, y * rb, x, c, ch, depth, u16(v))
+
+    var img = image(w, h, kind, depth, data).unwrap()
+
+    if kind == 3
+        val entries = if top > 256 then 256 else top
+        val pal: []u8 = [0; 3 * entries]
+
+        for k in 0..<3 * entries
+            pal[k] = u8(r.next() & 255)
+
+        img.palette = pal
+
+        if clear
+            val al: []u8 = [0; entries / 2 + 1]
+
+            for k in 0..<al.len
+                al[k] = u8(k * 37 & 255)
+
+            img.alpha = al
+
+    if clear && (kind == 0 || kind == 2)
+        img.keyed = true
+        img.key = [img.sample(0, 0, 0), if kind == 2 then img.sample(0, 0, 1) else 0,
+                   if kind == 2 then img.sample(0, 0, 2) else 0]
+
+    img
+end synthetic
+
+// What is different between two images' pixels and what the file says about them, or "".
+private differ(a: Image, b: Image) -> string
+    if a.width != b.width || a.height != b.height then return "size"
+    if a.kind != b.kind || a.depth != b.depth then return "format"
+    if a.data != b.data then return "samples"
+    if a.palette != b.palette then return "palette"
+    if a.alpha != b.alpha then return "alphas"
+    if a.keyed != b.keyed || (a.keyed && a.key != b.key) then return "key"
+
+    ""
+end differ
+
+// The RGBA the image itself answers against stb's reading of the file, or "".
+private stb_differs(img: Image, file: []const u8) -> string
+    val wide = stb.decode_16(file, stb.Channels.Rgba).unwrap()
+    val px = wide.pixels()
+
+    for y in 0..<img.height
+        for x in 0..<img.width
+            val i = 4 * (y * img.width + x)
+            val p = img.at16(x, y)
+
+            if p.r != px[i] || p.g != px[i + 1] || p.b != px[i + 2] || p.a != px[i + 3]
+                return f"($x%d, $y%d)"
+
+    ""
+end stb_differs
+
+// Run pngcheck -v over every file in `dir`, answering how many it passed.
+private pngcheck_passes(dir: string) -> usize
+    var args: Buf[string] = buf()
+
+    args.push("-v")
+
+    for name in entries(dir).unwrap()
+        args.push(s"$dir/$name")
+
+    val out = capture("pngcheck", args.view()).unwrap()
+    var passed: usize = 0
+    var at: usize = 0
+
+    loop
+        out.text[at..].index_of("No errors detected") match
+            Some(i) ->
+                passed += 1
+                at += i + 1
+            None -> break
+
+    passed
+end pngcheck_passes
+
+private val kinds: [5]u8 = [0, 2, 3, 4, 6]
+
+@test("every colour type at every depth, plain and transparent, interlaced and not, round-trips and passes stb and pngcheck")
+every_format_round_trips()
+    val dir = make_temp_dir("png-write").unwrap()
+    var files: usize = 0
+
+    for kind in kinds
+        for depth in [u8(1), 2, 4, 8, 16]
+            if !depth_allowed(kind, depth) then continue
+
+            for clear in [false, true]
+                for interlaced in [false, true]
+                    for (w, h) in [(1usize, 1usize), (13, 9), (33, 17)]
+                        val img = synthetic(w, h, kind, depth, clear, u64(w * 1000 + usize(depth)))
+                        var opts = options()
+
+                        opts.interlaced = interlaced
+
+                        val file = encode(img, opts).unwrap()
+                        val back = decode(file.view()).unwrap()
+                        val what = s"type $kind depth $depth ${w}x$h clear $clear interlaced $interlaced"
+
+                        assert_eq(differ(img, back), "", what)
+                        assert(back.interlaced == interlaced, what)
+                        assert_eq(stb_differs(img, file.view()), "", what)
+
+                        write_bytes(s"$dir/t${kind}d${depth}c${clear}i${interlaced}w$w.png", file.view()).unwrap()
+                        files += 1
+
+    assert_eq(files, 180)
+    assert_eq(pngcheck_passes(dir), files)
+    remove_dir_all(dir).unwrap()
+end every_format_round_trips
+
+@test("each filter, fixed and adaptive, at every level, round-trips")
+every_filter_round_trips()
+    val img = synthetic(40, 30, 6, 16, false, 7)
+    val grey = synthetic(40, 30, 0, 8, false, 8)
+
+    for filter in [Filter.Nothing, Filter.Sub, Filter.Up, Filter.Average, Filter.Paeth, Filter.Adaptive]
+        for level in 0..9
+            var opts = options()
+
+            opts.filter = filter
+            opts.level = level
+
+            assert_eq(differ(img, decode(encode(img, opts).unwrap().view()).unwrap()), "")
+            assert_eq(differ(grey, decode(encode(grey, opts).unwrap().view()).unwrap()), "")
+end every_filter_round_trips
+
+// The filter bytes of a written file, read back out of its unpacked image data.
+private filters_used(file: []const u8, rb: usize, h: usize) -> Buf[u8]
+    var at: usize = 8
+    var z: Buf[u8] = buf()
+
+    while at < file.len
+        val len = usize(get_u32_be(file[at..]).unwrap())
+
+        if file[at + 4] == 73 && file[at + 5] == 68 then z.extend(file[at + 8..<at + 8 + len])
+
+        at += 12 + len
+
+    val raw: []u8 = [0; h * (1 + rb)]
+
+    inflate.zlib(z.view(), raw).unwrap()
+
+    var out: Buf[u8] = buf()
+
+    for y in 0..<h
+        out.push(raw[y * (1 + rb)])
+
+    out
+end filters_used
+
+@test("a fixed filter is used on every row; adaptive picks per row, and none for a palette")
+the_filter_written_is_the_filter_asked_for()
+    val img = synthetic(20, 6, 2, 8, false, 3)
+    var opts = options()
+
+    opts.filter = Filter.Paeth
+
+    for f in filters_used(encode(img, opts).unwrap().view(), 60, 6)
+        assert_eq(f, 4)
+
+    // A plane: Paeth predicts every byte below the first row but the first pixel exactly, so it wins
+    // from the second row on; on the first, with no row above, it is Sub, and the tie goes to Sub.
+    val ramp: []u8 = [0; 6 * 60]
+
+    for y in 0..<6usize
+        for i in 0..<60usize
+            ramp[y * 60 + i] = u8(i + y * 30)
+
+    opts.filter = Filter.Adaptive
+
+    val chosen = filters_used(encode(image(20, 6, 2, 8, ramp).unwrap(), opts).unwrap().view(), 60, 6)
+
+    assert_eq(chosen[0], 1)
+
+    for y in 1..<6usize
+        assert_eq(chosen[y], 4)
+
+    val pal = synthetic(20, 6, 3, 8, false, 4)
+
+    for f in filters_used(encode(pal, opts).unwrap().view(), 20, 6)
+        assert_eq(f, 0)
+end the_filter_written_is_the_filter_asked_for
+
+@test("the image data is cut into IDAT chunks of the size asked for")
+idat_is_split()
+    val img = synthetic(64, 64, 2, 8, false, 5)
+    var opts = options()
+
+    opts.chunk = 1000
+    opts.level = 0
+
+    val file = encode(img, opts).unwrap()
+    var at: usize = 8
+    var idats = 0
+    var biggest: usize = 0
+
+    while at < file.len()
+        val len = usize(get_u32_be(file.view()[at..]).unwrap())
+
+        if file[at + 4] == 73 && file[at + 5] == 68
+            idats += 1
+
+            if len > biggest then biggest = len
+
+        at += 12 + len
+
+    // 64 rows of 193 bytes, stored: 12,352 bytes and the stored blocks' headers, in 13 chunks.
+    assert_eq(idats, 13)
+    assert_eq(biggest, 1000)
+    assert_eq(differ(img, decode(file.view()).unwrap()), "")
+end idat_is_split
+
+@test("every valid PngSuite image re-encoded reads back the same, and pngcheck passes all of them")
+pngsuite_reencodes()
+    val dir = make_temp_dir("png-resuite").unwrap()
+    var n: usize = 0
+
+    for name in suite(true)
+        val img = decode(bytes_of(name)).unwrap()
+
+        for interlaced in [false, true]
+            var opts = options()
+
+            opts.interlaced = interlaced
+
+            val file = encode(img, opts).unwrap()
+            val back = decode(file.view()).unwrap()
+
+            assert_eq(differ(img, back), "", name)
+            assert(back.info.gamma == img.info.gamma, name)
+            assert_eq(back.info.texts.len(), img.info.texts.len(), name)
+
+            for k in 0..<img.info.texts.len()
+                assert_eq(back.info.texts[k].text, img.info.texts[k].text, name)
+                assert_eq(back.info.texts[k].keyword, img.info.texts[k].keyword, name)
+
+            write_bytes(s"$dir/$interlaced-$name", file.view()).unwrap()
+            n += 1
+
+    assert_eq(n, 324)
+    assert_eq(pngcheck_passes(dir), n)
+    remove_dir_all(dir).unwrap()
+end pngsuite_reencodes
+
+@test("gamma, sRGB, a colour profile, physical size and all three kinds of text are written and read back")
+ancillary_chunks_round_trip()
+    var img = synthetic(9, 7, 2, 8, false, 9)
+    val icc: []u8 = [0; 3000]
+
+    for k in 0..<3000usize
+        icc[k] = u8(k * 7 % 251)
+
+    img.info.gamma = Some(45455)
+    img.info.profile = Some(Profile("sRGB built-in", icc))
+    img.info.phys = Some(Phys(2835, 2835, true))
+    img.info.texts.push(Text("Title", "Café au lait", false, false, "", ""))
+    img.info.texts.push(Text("Comment", "a long comment, compressed, a long comment", false, true, "", ""))
+    img.info.texts.push(Text("Author", "Ελληνικά", true, false, "el", "Συγγραφέας"))
+    img.info.texts.push(Text("Description", "日本語のテキスト、圧縮", true, true, "ja", "説明"))
+
+    val file = encode(img).unwrap()
+    val back = decode(file.view()) match
+        Ok(b) -> b
+        Err(e) ->
+            assert(false, s"$e")
+            return
+    val i = back.info
+
+    assert_eq(i.gamma.unwrap(), 45455)
+    assert(i.srgb.is_none(), "no sRGB")
+    assert_eq(i.profile.unwrap().name, "sRGB built-in")
+    assert(i.profile.unwrap().data == icc, "the profile")
+    assert_eq(i.phys.unwrap().x, 2835)
+    assert(i.phys.unwrap().metre, "metres")
+    assert_eq(i.texts.len(), 4)
+
+    for k in 0..<4usize
+        val a = img.info.texts[k]
+        val b = i.texts[k]
+
+        assert_eq(b.keyword, a.keyword)
+        assert_eq(b.text, a.text)
+        assert(b.international == a.international && b.compressed == a.compressed, a.keyword)
+        assert_eq(b.language, a.language)
+        assert_eq(b.translated, a.translated)
+
+    // sRGB in a file of its own, since a file may carry it or a profile but not both.
+    var srgb = synthetic(9, 7, 6, 16, false, 10)
+
+    srgb.info.srgb = Some(3)
+
+    val second = encode(srgb).unwrap()
+
+    assert_eq(decode(second.view()).unwrap().info.srgb.unwrap(), 3)
+
+    srgb.info.profile = Some(Profile("p", icc))
+    assert_eq(s"${encode(srgb).unwrap_err()}", "an image that has both an sRGB chunk and a colour profile")
+
+    val dir = make_temp_dir("png-anc").unwrap()
+
+    write_bytes(s"$dir/anc.png", file.view()).unwrap()
+    write_bytes(s"$dir/srgb.png", second.view()).unwrap()
+    assert_eq(pngcheck_passes(dir), 2)
+    remove_dir_all(dir).unwrap()
+end ancillary_chunks_round_trip
+
+private refused(img: Image) -> string = encode(img) match
+    Ok(_) -> "written"
+    Err(e) -> s"$e"
+
+@test("an image no file could hold is refused before a byte is written")
+the_writer_refuses()
+    val data: []u8 = [0; 12]
+
+    assert_eq(s"${image(2, 2, 2, 4, data).unwrap_err()}", "4 bits a sample is not a depth colour type 2 has")
+    assert_eq(s"${image(2, 2, 7, 8, data).unwrap_err()}", "colour type 7 is not one of the five")
+    assert_eq(s"${image(0, 2, 2, 8, data).unwrap_err()}", "an image with no pixels in it")
+    assert_eq(s"${image(2, 2, 2, 8, data[..<11]).unwrap_err()}", "the rows need 12 bytes and the data unpacks to 11")
+
+    var pal = synthetic(4, 4, 3, 8, false, 1)
+
+    pal.palette = pal.palette[..<6]
+    assert_eq(refused(pal), "a pixel naming colour 65, past the end of the palette")
+    pal.palette = []
+    assert_eq(refused(pal), "a paletted image with no palette")
+    pal.palette = [u8(1), 2, 3, 4]
+    assert_eq(refused(pal), "a palette of 4 bytes, which is not one to 256 colours of three")
+
+    var keyed = synthetic(4, 4, 0, 4, false, 1)
+
+    keyed.keyed = true
+    keyed.key = [16, 0, 0]
+    assert_eq(refused(keyed), "an image that has a transparent colour it cannot hold")
+
+    var ga = synthetic(4, 4, 4, 8, false, 1)
+
+    ga.keyed = true
+    assert_eq(refused(ga), "an image that has a transparent colour and no room for one")
+
+    var grey = synthetic(4, 4, 0, 8, false, 1)
+
+    grey.palette = [u8(1), 2, 3]
+    assert_eq(refused(grey), "an image that is grey and has a palette")
+
+    var text = synthetic(4, 4, 0, 8, false, 1)
+
+    text.info.texts.push(Text("Title", "日本", false, false, "", ""))
+    assert_eq(refused(text), "a 'tEXt' chunk whose contents are not what that chunk holds")
+
+    var key = synthetic(4, 4, 0, 8, false, 1)
+
+    key.info.texts.push(Text(" leading space", "x", false, false, "", ""))
+    assert_eq(refused(key), "a 'tEXt' chunk whose contents are not what that chunk holds")
+
+    var o = options()
+
+    o.chunk = 0
+    assert_eq(s"${encode(synthetic(4, 4, 0, 8, false, 1), o).unwrap_err()}", "an image that is to be cut into chunks of no size")
+end the_writer_refuses

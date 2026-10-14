@@ -11,6 +11,12 @@
  * rows -- and a checksum over each of the two layers. Being wrong by one anywhere in that produces
  * an image, just not the right one.
  *
+ * Every colour type is read at every depth the format allows it — 1, 2, 4, 8 and 16 bits a sample —
+ * interlaced or not, with its palette, its transparency and the ancillary chunks a program asks
+ * about: gamma, sRGB, the colour profile, the physical size and the three kinds of text. An animated
+ * PNG reads through `decode` as its default image, as every reader that does not know about
+ * animation sees it, and through `decode_animation` as its frames.
+ *
  * The deflate stream is `sh.sysl.png.inflate`'s, which is its own format with its own errors and no
  * opinion about what the bytes it produces mean. A program wanting raw DEFLATE and no pictures may
  * import that module alone.
@@ -25,6 +31,9 @@ import sh.sysl.png.inflate
 // (`reference/types.md § Integers are an open family`).
 import sysl.math.Signed
 import sysl.encoding.get_u32_be
+import sysl.buf.{Buf, buf}
+import sysl.slices.copy
+import sysl.text.from_utf8
 
 // What a file can be wrong about. A reader of somebody else's format needs a lot of these, and
 // naming them individually is the difference between "this file is broken" and a report that says
@@ -35,18 +44,24 @@ enum Fault
     BadCrc(at: usize)
     NoHeader
     BadSize
-    BadDepth(d: u8)
+    BadDepth(d: u8, kind: u8)
     BadColour(c: u8)
     BadCompression
     BadFilterMethod
-    Interlaced
+    BadInterlace(m: u8)
     Unknown(name: string)
     NoPalette
+    BadPalette(len: usize)
+    BadIndex(i: u8)
     NoPixels
     NoEnd
     BadFilter(f: u8, row: usize)
     Squashed(f: inflate.Fault)
     WrongSize(want: usize, got: usize)
+    Misplaced(name: string)
+    BadChunk(name: string)
+    BadAnimation(why: string)
+    BadImage(why: string)
 end Fault
 
 describe(f: Fault) -> string
@@ -56,18 +71,24 @@ describe(f: Fault) -> string
         BadCrc(at) -> s"the chunk at ${str(at)} does not match its checksum"
         NoHeader -> "the header is not the first chunk"
         BadSize -> "an image with no pixels in it"
-        BadDepth(d) -> s"${str(d)} bits a sample, and this reader knows only 8"
+        BadDepth(d, kind) -> s"${str(d)} bits a sample is not a depth colour type ${str(kind)} has"
         BadColour(c) -> s"colour type ${str(c)} is not one of the five"
         BadCompression -> "compressed by something other than deflate"
         BadFilterMethod -> "filtered by a method this format does not have"
-        Interlaced -> "interlaced, and this reader reads rows in order"
+        BadInterlace(m) -> s"interlace method ${str(m)} is not one the format has"
         Unknown(name) -> s"a chunk named '$name' that must be understood and is not"
         NoPalette -> "a paletted image with no palette"
+        BadPalette(len) -> s"a palette of ${str(len)} bytes, which is not one to 256 colours of three"
+        BadIndex(i) -> s"a pixel naming colour ${str(i)}, past the end of the palette"
         NoPixels -> "no image data"
         NoEnd -> "the last chunk is not the end chunk"
         BadFilter(f, row) -> s"row ${str(row)} claims filter ${str(f)}"
         Squashed(e) -> inflate.describe(e)
         WrongSize(want, got) -> s"the rows need ${str(want)} bytes and the data unpacks to ${str(got)}"
+        Misplaced(name) -> s"a '$name' chunk where the format does not allow one"
+        BadChunk(name) -> s"a '$name' chunk whose contents are not what that chunk holds"
+        BadAnimation(why) -> s"an animation that $why"
+        BadImage(why) -> s"an image that $why"
 end describe
 
 /** A fault renders as what it says, so `s"$f"` and `print(f)` say the same thing `describe` does.
@@ -78,58 +99,169 @@ end describe
 impl Display for Fault
     display(self, out: *Writer, fmt: FormatSpec) = display_str(describe(self), out, fmt)
 
-// One pixel, as every colour type is understood once it has been read.
+// A deflate stream's fault is the file's, so a `?` on an unpacking says so without a word.
+impl From[inflate.Fault] for Fault
+    from(value: inflate.Fault) -> Fault = Squashed(value)
+
+// One pixel, as every colour type is understood once it has been read, eight bits a channel.
 struct Rgba
     r: u8
     g: u8
     b: u8
     a: u8
 
-// A decoded image. `raw` is the unpacked pixel data *after* the filters have been undone, still
-// carrying the spent filter byte at the head of each row — leaving it there costs one addition per
-// row and saves copying the whole image to remove it.
-//
-// `palette` views the source buffer rather than copying it, which is the one place this program
-// keeps a view of somebody else's storage rather than storage of its own. It is also why an `Image`
-// may not outlive the bytes it was decoded from, and why nothing here has to say so: a slice
-// retains what it views.
+// One pixel at sixteen bits a channel, which is every sample of every file exactly.
+struct Rgba16
+    r: u16
+    g: u16
+    b: u16
+    a: u16
+
+/** How large a pixel is in the world: `x` and `y` pixels per metre when `metre`, or only their
+ * ratio when not.
+ */
+struct Phys
+    x: u32
+    y: u32
+    metre: bool
+
+/** An embedded ICC profile: its name, and the profile itself, unpacked. */
+struct Profile
+    name: string
+    data: []u8
+
+/** A text chunk. `international` is an `iTXt`, which is UTF-8 and may name a language and carry the
+ * keyword translated; otherwise it is a `tEXt` or, `compressed`, a `zTXt`, both Latin-1 in the file
+ * and UTF-8 here. An `iTXt` may be compressed too.
+ */
+struct Text
+    keyword: string
+    text: string
+    international: bool
+    compressed: bool
+    language: string
+    translated: string
+
+/** The ancillary chunks a program asks about. `gamma` is the file's number, the gamma times 100,000;
+ * `srgb` the rendering intent of an `sRGB` chunk. Chunks this reader does not ask about are skipped,
+ * as an ancillary chunk may be.
+ */
+struct Info
+    gamma: Option[u32]
+    srgb: Option[u8]
+    phys: Option[Phys]
+    profile: Option[Profile]
+    texts: Buf[Text]
+
+/** No ancillary chunks at all, which is what a new image starts with. */
+info() -> Info = Info(None, None, None, None, buf())
+
+/** A decoded image.
+ *
+ * `data` is the pixels as the file's own samples: rows top to bottom, each `row_bytes()` long, with
+ * samples narrower than a byte packed from the most significant bit and sixteen-bit samples
+ * big-endian, exactly as PNG lays a row out — but whole, with the filter bytes gone and the
+ * interlacing undone. `interlaced` says only how the file stored it.
+ *
+ * `palette` is the colour type 3 palette as red-green-blue triples, and `alpha` the opacity of its
+ * first `alpha.len` entries from a `tRNS` chunk (the rest are opaque). For grey and truecolour,
+ * `keyed` says a `tRNS` chunk named one colour transparent, and `key` is that colour as samples —
+ * the grey in `key[0]`, or red, green and blue.
+ *
+ * `palette` and `alpha` view the source buffer rather than copying it, which is why an `Image` may
+ * not outlive the bytes it was decoded from, and why nothing here has to say so: a slice retains
+ * what it views.
+ */
 struct Image
     width: usize
     height: usize
     kind: u8
-    raw: []u8
-    palette: []u8
+    depth: u8
+    interlaced: bool
+    data: []u8
+    palette: []const u8
+    alpha: []const u8
+    keyed: bool
+    key: [3]u16
+    info: Info
 
     channels(self) -> usize = channels_of(self.kind)
 
-    stride(self) -> usize = 1 + self.width * self.channels()
+    row_bytes(self) -> usize = row_bytes_of(self.width, self.kind, self.depth)
 
-    // Where one pixel's samples begin: past the rows above it, past this row's filter byte, past
-    // the pixels to its left. Three units in one expression, which is the whole difficulty of a
-    // raster format written down.
-    //
-    // `private`, this being nobody's business but `at`'s. A member's visibility is the file that
-    // declares it, so `at` below reaches it and the checks next door cannot.
-    private index(self, x: usize, y: usize) -> usize = y * self.stride() + 1 + x * self.channels()
+    /** Sample `c` of the pixel at `x`, `y`, as the file has it: a palette index, or a value of
+     * `depth` bits.
+     */
+    sample(self, x: usize, y: usize, c: usize) -> u16
+        val row = y * self.row_bytes()
+        val d = usize(self.depth)
+        val i = x * self.channels() + c
 
-    at(self, x: usize, y: usize) -> Rgba
-        var i = self.index(x, y)
+        if d == 8 then return u16(self.data[row + i])
+        if d == 16 then return u16(self.data[row + 2 * i]) << 8 | u16(self.data[row + 2 * i + 1])
+
+        val bit = i * d
+        val b = self.data[row + bit / 8]
+
+        u16(b >> u8(8 - d - bit % 8) & u8((1 << d) - 1))
+    end sample
+
+    /** The pixel at `x`, `y` at sixteen bits a channel. A narrower sample is scaled by repeating its
+     * bits, so the largest value of every depth is 65,535; a palette is looked up, and the alpha is
+     * the file's, or what its `tRNS` chunk says, or opaque.
+     */
+    at16(self, x: usize, y: usize) -> Rgba16
+        val d = self.depth
 
         self.kind match
-            0 -> Rgba(self.raw[i], self.raw[i], self.raw[i], 255)
-            2 -> Rgba(self.raw[i], self.raw[i + 1], self.raw[i + 2], 255)
-            3 ->
-                var p = usize(self.raw[i]) * 3
+            0 ->
+                val v = self.sample(x, y, 0)
+                val g = scale(v, d)
 
-                Rgba(self.palette[p], self.palette[p + 1], self.palette[p + 2], 255)
-            4 -> Rgba(self.raw[i], self.raw[i], self.raw[i], self.raw[i + 1])
-            else Rgba(self.raw[i], self.raw[i + 1], self.raw[i + 2], self.raw[i + 3])
-    end at
+                Rgba16(g, g, g, if self.keyed && v == self.key[0] then 0 else 65535)
+            2 ->
+                val r = self.sample(x, y, 0)
+                val g = self.sample(x, y, 1)
+                val b = self.sample(x, y, 2)
+                val clear = self.keyed && r == self.key[0] && g == self.key[1] && b == self.key[2]
+
+                Rgba16(scale(r, d), scale(g, d), scale(b, d), if clear then 0 else 65535)
+            3 ->
+                val i = usize(self.sample(x, y, 0))
+                val a = if i < self.alpha.len then u16(self.alpha[i]) * 257 else 65535
+
+                Rgba16(u16(self.palette[3 * i]) * 257, u16(self.palette[3 * i + 1]) * 257,
+                       u16(self.palette[3 * i + 2]) * 257, a)
+            4 ->
+                val g = scale(self.sample(x, y, 0), d)
+
+                Rgba16(g, g, g, scale(self.sample(x, y, 1), d))
+            else Rgba16(scale(self.sample(x, y, 0), d), scale(self.sample(x, y, 1), d),
+                        scale(self.sample(x, y, 2), d), scale(self.sample(x, y, 3), d))
+    end at16
+
+    /** The pixel at `x`, `y` at eight bits a channel: `at16` with each channel's high byte, which for
+     * a sample of eight bits or fewer is the sample scaled exactly.
+     */
+    at(self, x: usize, y: usize) -> Rgba
+        val p = self.at16(x, y)
+
+        Rgba(u8(p.r >> 8), u8(p.g >> 8), u8(p.b >> 8), u8(p.a >> 8))
 end Image
+
+// A sample of `depth` bits stretched to sixteen by repeating its bits: the multipliers are 65,535
+// divided by each depth's largest value.
+private scale(v: u16, depth: u8) -> u16 =
+    depth match
+        16 -> v
+        8 -> v * 257
+        4 -> v * 0x1111
+        2 -> v * 0x5555
+        else v * 0xFFFF
 
 // How many samples a pixel of each colour type has: grey, truecolour, a palette index, grey with
 // alpha, and truecolour with alpha. Every length in the format is counted in these.
-private channels_of(kind: u8) -> usize
+private[png] channels_of(kind: u8) -> usize
     kind match
         0 -> 1
         2 -> 3
@@ -137,6 +269,17 @@ private channels_of(kind: u8) -> usize
         4 -> 2
         else 4
 end channels_of
+
+private[png] row_bytes_of(width: usize, kind: u8, depth: u8) -> usize =
+    (width * channels_of(kind) * usize(depth) + 7) / 8
+
+// Whether a colour type may have a depth: every depth for grey, up to 8 for a palette, and 8 or 16
+// for the three that carry more than one sample.
+private[png] depth_allowed(kind: u8, depth: u8) -> bool =
+    kind match
+        0 -> depth == 1 || depth == 2 || depth == 4 || depth == 8 || depth == 16
+        3 -> depth == 1 || depth == 2 || depth == 4 || depth == 8
+        else depth == 8 || depth == 16
 
 // One entry of the checksum table: the byte `n` run through the polynomial eight times, which is
 // what the bit-at-a-time loop would have done for it.
@@ -170,14 +313,18 @@ struct Crc32
     private table: [256]u32
 
     /** The checksum of `data`, as every chunk of a PNG carries it. */
-    of(self, data: []const u8) -> u32
-        var c: u32 = 0xFFFFFFFF
+    of(self, data: []const u8) -> u32 = self.feed(0xFFFFFFFF, data) ^ 0xFFFFFFFF
+
+    // The running state carried across one more run of bytes, for a checksum over two runs that do
+    // not sit side by side — a chunk's name and its body, when a writer has them apart.
+    private[png] feed(self, start: u32, data: []const u8) -> u32
+        var c = start
 
         for x in data
             c = self.table[usize((c ^ u32(x)) & 255)] ^ c >> 8
 
-        c ^ 0xFFFFFFFF
-    end of
+        c
+    end feed
 end Crc32
 
 /** A table, built. */
@@ -198,16 +345,13 @@ end crc32_table
  */
 crc32(data: []const u8) -> u32 = crc32_table().of(data)
 
-// A big-endian word at an offset. The four shifts were written out here until `sysl.encoding` grew
-// them; what stays hand-written is `crc32` above, because that polynomial and that table are PNG's
-// own and no library supplies them. The distinction is worth drawing: this file is about the bytes
-// **PNG** laid out, not about how to assemble four of them into a number.
-//
-// `unwrap` rather than a check, because it traps exactly where the four subscripts used to: every
-// caller has already established the chunk it is reading is present.
-private be32(b: []u8, i: usize) -> u32 = get_u32_be(b[i..]).unwrap()
+// A big-endian word at an offset. `unwrap` rather than a check, because it traps exactly where the
+// four subscripts would: every caller has already established the chunk it is reading is present.
+private[png] be32(b: []const u8, i: usize) -> u32 =get_u32_be(b[i..]).unwrap()
 
-private named(b: []u8, at: usize, name: string) -> bool
+private be16(b: []const u8, i: usize) -> u16 = u16(b[i]) << 8 | u16(b[i + 1])
+
+private named(b: []const u8, at: usize, name: string) -> bool
     for i in 0..<4usize
         if b[at + i] != name[i] then return false
 
@@ -215,7 +359,7 @@ private named(b: []u8, at: usize, name: string) -> bool
 
 // A chunk name, as text. Four bytes that are known to be letters, and the only way to get from
 // bytes to a `string` is one character at a time through the rendering of a `char`.
-private name_of(b: []u8, at: usize) -> string
+private[png] name_of(b: []const u8, at: usize) -> string
     var s = ""
 
     for i in 0..<4usize
@@ -224,35 +368,99 @@ private name_of(b: []u8, at: usize) -> string
     s
 end name_of
 
-// Read a file. The two intermediate stages — somewhere to gather the compressed data, somewhere to
-// unpack it to — are this function's own, so the signature is a file in and an image out.
-//
-// This used to take three slices, because neither stage could be sized without reading a header
-// that is read *here*: the caller had to size both and be told `NoRoom` when it guessed low. Both
-// are now storage declared as a `[]T`, which is the form that takes a length computed while
-// running. `zbuf` is sized at the whole file, which is an upper bound rather than a guess — every
-// byte it gathers is a byte of `src` — and `raw` is sized exactly, from a header that by then has
-// been read.
-decode(src: []u8) -> Result[Image, Fault]
+/** How a frame's region is left before the next frame is drawn: as it is, cleared to transparent
+ * black, or put back to what it was before this frame.
+ */
+enum Dispose
+    Keep
+    Clear
+    Restore
+
+/** How a frame is drawn over what is there: replacing it, or composited over it by its alpha. */
+enum Blend
+    Replace
+    Over
+
+/** One frame of an animation: an image covering `width` by `height` of the canvas at `x`, `y`,
+ * shown for `delay_num / delay_den` seconds (a `delay_den` of zero meaning hundredths).
+ */
+struct Frame
+    image: Image
+    x: usize
+    y: usize
+    delay_num: u16
+    delay_den: u16
+    dispose: Dispose
+    blend: Blend
+
+/** An animated PNG: the default image every reader sees, the frames, and how many times to play
+ * them (zero for ever). `default_is_frame` says the default image is the first frame; when it is
+ * not, it is a still shown by readers that do not animate, and `frames` does not include it.
+ */
+struct Animation
+    image: Image
+    frames: Buf[Frame]
+    plays: u32
+    default_is_frame: bool
+
+/** Read a file into its default image. An animated file reads as its default image too, which is
+ * what it was designed to look like to a reader that knows nothing of animation.
+ */
+decode(src: []const u8) -> Result[Image, Fault] = Ok(read(src, false)?.image)
+
+/** Read an animated PNG into its frames. A still image reads as an animation of none. */
+decode_animation(src: []const u8) -> Result[Animation, Fault] = read(src, true)
+
+// A frame control chunk, read and waiting for the data that follows it.
+private struct Control
+    width: usize
+    height: usize
+    x: usize
+    y: usize
+    delay_num: u16
+    delay_den: u16
+    dispose: Dispose
+    blend: Blend
+    is_default: bool
+
+// Where the chunk walk has got to, which is what the ordering rules are written in.
+private struct Order
+    plte: bool
+    idat: bool
+    after_idat: bool
+    actl: bool
+
+// Read the whole file. The two intermediate stages — somewhere to gather the compressed data,
+// somewhere to unpack it to — are this function's own, so the signature is a file in and an image
+// out. `zbuf` is sized at the whole file, which is an upper bound rather than a guess: every byte
+// it gathers is a byte of `src`.
+private read(src: []const u8, want_frames: bool) -> Result[Animation, Fault]
     var signature: [8]u8 = [137, 80, 78, 71, 13, 10, 26, 10]
 
     if src.len < 8 then return Err(NotPng)
 
-    val zbuf: []u8 = [0; src.len]
+    for i in 0..<8
+        if src[i] != signature[i] then return Err(NotPng)
 
     // One table for the whole file rather than one per chunk, which is the whole reason `Crc32` is a
     // value and not something the module keeps.
     var crc = crc32_table()
-
-    for i in 0..<8
-        if src[i] != signature[i] then return Err(NotPng)
-
-    var width: usize = 0
-    var height: usize = 0
-    var kind: u8 = 0
-    var palette = src[0..<0]
+    val zbuf: []u8 = [0; src.len]
+    var img = Image(0, 0, 0, 0, false, [], src[0..<0], src[0..<0], false, [0, 0, 0], info())
+    var o = Order(false, false, false, false)
     var zn: usize = 0
     var at: usize = 8
+
+    // The animation: how many frames `acTL` promised, the next sequence number, the frames read,
+    // and the one whose data is being gathered.
+    var nframes: u32 = 0
+    var plays: u32 = 0
+    var seq: u32 = 0
+    var frames: Buf[Frame] = buf()
+    var pending: Option[Control] = None
+    var fz: Buf[u8] = buf()
+    var default_is_frame = false
+    var counted: u32 = 0
 
     loop
         if at == src.len then return Err(NoEnd)
@@ -260,38 +468,136 @@ decode(src: []u8) -> Result[Image, Fault]
 
         var len = usize(be32(src, at))
 
-        if at + 12 + len > src.len then return Err(Truncated(at))
+        if len > 0x7FFFFFFF || at + 12 + len > src.len then return Err(Truncated(at))
 
         // The checksum covers the name and the data but not the length, so a chunk whose length
         // was corrupted is caught by the *next* chunk failing to be where it should be.
         if crc.of(src[at + 4..<at + 8 + len]) != be32(src, at + 8 + len) then return Err(BadCrc(at))
 
-        var body = src[at + 8..<at + 8 + len]
+        val body = src[at + 8..<at + 8 + len]
+        val idat = named(src, at + 4, "IDAT")
+
+        // The first chunk after the image data ends the run of it.
+        if o.idat && !idat then o.after_idat = true
 
         if named(src, at + 4, "IHDR")
             if at != 8 || len != 13 then return Err(NoHeader)
 
-            width = usize(be32(body, 0))
-            height = usize(be32(body, 4))
-            kind = body[9]
+            img.width = usize(be32(body, 0))
+            img.height = usize(be32(body, 4))
+            img.depth = body[8]
+            img.kind = body[9]
 
-            if width == 0 || height == 0 then return Err(BadSize)
-            if body[8] != 8 then return Err(BadDepth(body[8]))
-            if kind != 0 && kind != 2 && kind != 3 && kind != 4 && kind != 6 then return Err(BadColour(kind))
+            if img.width == 0 || img.height == 0 then return Err(BadSize)
+            if img.width > 0x7FFFFFFF || img.height > 0x7FFFFFFF then return Err(BadSize)
+
+            if img.kind != 0 && img.kind != 2 && img.kind != 3 && img.kind != 4 && img.kind != 6
+                return Err(BadColour(img.kind))
+
+            if !depth_allowed(img.kind, img.depth) then return Err(BadDepth(img.depth, img.kind))
             if body[10] != 0 then return Err(BadCompression)
             if body[11] != 0 then return Err(BadFilterMethod)
-            if body[12] != 0 then return Err(Interlaced)
+            if body[12] > 1 then return Err(BadInterlace(body[12]))
+
+            img.interlaced = body[12] == 1
         else if at == 8
             return Err(NoHeader)
-        else if named(src, at + 4, "PLTE")
-            palette = body
-        else if named(src, at + 4, "IDAT")
+        else if idat
+            if o.after_idat then return Err(Misplaced("IDAT"))
+
+            o.idat = true
+
             for i in 0..<len
                 zbuf[zn + i] = body[i]
 
             zn += len
         else if named(src, at + 4, "IEND")
             break
+        else if named(src, at + 4, "PLTE")
+            if o.plte || o.idat || img.kind == 0 || img.kind == 4 then return Err(Misplaced("PLTE"))
+            if len == 0 || len > 768 || len % 3 != 0 then return Err(BadPalette(len))
+
+            o.plte = true
+            img.palette = body
+        else if named(src, at + 4, "tRNS")
+            if o.idat || (img.kind == 3 && !o.plte) then return Err(Misplaced("tRNS"))
+
+            img.kind match
+                0 ->
+                    if len != 2 then return Err(BadChunk("tRNS"))
+
+                    img.keyed = true
+                    img.key[0] = be16(body, 0)
+                2 ->
+                    if len != 6 then return Err(BadChunk("tRNS"))
+
+                    img.keyed = true
+                    img.key = [be16(body, 0), be16(body, 2), be16(body, 4)]
+                3 ->
+                    if len > img.palette.len / 3 then return Err(BadChunk("tRNS"))
+
+                    img.alpha = body
+                else return Err(Misplaced("tRNS"))
+        else if named(src, at + 4, "gAMA")
+            if o.plte || o.idat then return Err(Misplaced("gAMA"))
+            if len != 4 then return Err(BadChunk("gAMA"))
+
+            img.info.gamma = Some(be32(body, 0))
+        else if named(src, at + 4, "sRGB")
+            if o.plte || o.idat then return Err(Misplaced("sRGB"))
+            if len != 1 || body[0] > 3 then return Err(BadChunk("sRGB"))
+
+            img.info.srgb = Some(body[0])
+        else if named(src, at + 4, "iCCP")
+            if o.plte || o.idat then return Err(Misplaced("iCCP"))
+
+            img.info.profile = Some(profile_of(body)?)
+        else if named(src, at + 4, "pHYs")
+            if o.idat then return Err(Misplaced("pHYs"))
+            if len != 9 || body[8] > 1 then return Err(BadChunk("pHYs"))
+
+            img.info.phys = Some(Phys(be32(body, 0), be32(body, 4), body[8] == 1))
+        else if named(src, at + 4, "tEXt") || named(src, at + 4, "zTXt") || named(src, at + 4, "iTXt")
+            img.info.texts.push(text_of(body, name_of(src, at + 4))?)
+        else if named(src, at + 4, "acTL")
+            if o.idat || o.actl then return Err(Misplaced("acTL"))
+            if len != 8 then return Err(BadChunk("acTL"))
+
+            o.actl = true
+            nframes = be32(body, 0)
+            plays = be32(body, 4)
+
+            if nframes == 0 then return Err(BadAnimation("promises no frames"))
+        else if named(src, at + 4, "fcTL") && o.actl
+            if len != 26 then return Err(BadChunk("fcTL"))
+            if be32(body, 0) != seq then return Err(BadAnimation(s"has chunk ${seq} out of sequence"))
+
+            seq += 1
+
+            // A frame after the image data may close the default image's frame, which needs the
+            // image read.
+            if o.idat then pixels(&img, zbuf[..<zn])?
+
+            finish(&frames, pending, fz, &img, want_frames)?
+            fz.clear()
+
+            val c = control(body, &img, o.idat)?
+
+            if c.is_default then default_is_frame = true
+
+            pending = Some(c)
+            counted += 1
+        else if named(src, at + 4, "fdAT") && o.actl
+            if len < 4 then return Err(BadChunk("fdAT"))
+            if be32(body, 0) != seq then return Err(BadAnimation(s"has chunk ${seq} out of sequence"))
+
+            pending match
+                None -> return Err(BadAnimation("has frame data with no frame control before it"))
+                Some(c) ->
+                    if c.is_default then return Err(BadAnimation("has frame data for its default image"))
+
+            seq += 1
+            fz.extend(body[4..])
         else if src[at + 4] & 32 == 0
             // The fifth bit of the first letter is its case, and its case is the rule: a name
             // beginning with a capital is a chunk a reader must understand to be reading the file
@@ -302,58 +608,325 @@ decode(src: []u8) -> Result[Image, Fault]
         at += 12 + len
 
     if zn == 0 then return Err(NoPixels)
-    if kind == 3 && palette.len == 0 then return Err(NoPalette)
 
-    var channels = channels_of(kind)
-    var stride = 1 + width * channels
-    var need = stride * height
+    pixels(&img, zbuf[..<zn])?
+
+    if o.actl
+        finish(&frames, pending, fz, &img, want_frames)?
+
+        if counted != nframes
+            return Err(BadAnimation(s"promises ${nframes} frames and has ${counted}"))
+
+    Ok(Animation(img, frames, plays, default_is_frame))
+end read
+
+// The image's own pixels, unpacked from the gathered data the first time they are wanted.
+private pixels(img: *Image, z: []const u8) -> Result[unit, Fault]
+    if img.data.len > 0 then return Ok(())
+    if img.kind == 3 && img.palette.len == 0 then return Err(NoPalette)
+
+    img.data = unpack(z, img.width, img.height, img.kind, img.depth, img.interlaced)?
+
+    if img.kind == 3 then indexed(*img)?
+
+    Ok(())
+end pixels
+
+// Every palette index in range: a file naming a colour its palette does not have is broken, and
+// finding out here is what lets `at` index the palette without a check.
+private[png] indexed(img: Image) -> Result[unit, Fault]
+    val entries = img.palette.len / 3
+
+    if entries >= 1 << usize(img.depth) then return Ok(())
+
+    for y in 0..<img.height
+        for x in 0..<img.width
+            val i = img.sample(x, y, 0)
+
+            if usize(i) >= entries then return Err(BadIndex(u8(i)))
+
+    Ok(())
+end indexed
+
+// A frame control chunk, checked against the canvas it draws on.
+private control(body: []const u8, img: *Image, after_idat: bool) -> Result[Control, Fault]
+    val w = usize(be32(body, 4))
+    val h = usize(be32(body, 8))
+    val x = usize(be32(body, 12))
+    val y = usize(be32(body, 16))
+    val dispose = body[24]
+    val blend = body[25]
+
+    if w == 0 || h == 0 || x + w > img.width || y + h > img.height
+        return Err(BadAnimation("has a frame outside its canvas"))
+
+    if dispose > 2 then return Err(BadChunk("fcTL"))
+    if blend > 1 then return Err(BadChunk("fcTL"))
+
+    // A frame control before the image data makes the default image the first frame, and that
+    // frame has to be the whole canvas.
+    val is_default = !after_idat
+
+    if is_default && (w != img.width || h != img.height || x != 0 || y != 0)
+        return Err(BadAnimation("has a first frame that is not the whole canvas"))
+
+    val d = if dispose == 0 then Dispose.Keep else if dispose == 1 then Dispose.Clear else Dispose.Restore
+    val b = if blend == 0 then Blend.Replace else Blend.Over
+
+    Ok(Control(w, h, x, y, be16(body, 20), be16(body, 22), d, b, is_default))
+end control
+
+// Close the frame whose data has been gathered, if there is one. The default image's frame is
+// closed at the end, once the image itself has been read; the others are unpacked here.
+private finish(frames: *Buf[Frame], pending: Option[Control], fz: Buf[u8], img: *Image,
+               want: bool) -> Result[unit, Fault]
+    pending match
+        None -> return Ok(())
+        Some(c) ->
+            if c.is_default
+                if want then frames.push(Frame(*img, 0, 0, c.delay_num, c.delay_den, c.dispose, c.blend))
+
+                return Ok(())
+
+            if fz.len() == 0 then return Err(BadAnimation("has a frame with no data"))
+            if !want then return Ok(())
+
+            var f = *img
+
+            f.width = c.width
+            f.height = c.height
+            f.data = unpack(fz.view(), c.width, c.height, img.kind, img.depth, img.interlaced)?
+
+            if f.kind == 3 then indexed(f)?
+
+            frames.push(Frame(f, c.x, c.y, c.delay_num, c.delay_den, c.dispose, c.blend))
+            Ok(())
+end finish
+
+// The start of a chunk's body up to its first zero byte, and where the rest begins: the keyword
+// that every text and profile chunk opens with, one to 79 bytes of it.
+private keyword(body: []const u8, name: string) -> Result[(string, usize), Fault]
+    var n: usize = 0
+
+    while n < body.len && body[n] != 0
+        n += 1
+
+    if n == 0 || n > 79 || n == body.len then return Err(BadChunk(name))
+
+    Ok((latin1(body[..<n]), n + 1))
+end keyword
+
+// Latin-1 bytes as a string: each byte is the code point of the same number.
+private latin1(b: []const u8) -> string
+    var out: Buf[u8] = buf()
+
+    for x in b
+        if x < 128
+            out.push(x)
+        else
+            out.push(0xC0 | x >> 6)
+            out.push(0x80 | x & 0x3F)
+
+    from_utf8(out.view()).unwrap()
+end latin1
+
+private text_of(body: []const u8, name: string) -> Result[Text, Fault]
+    val (key, rest) = keyword(body, name)?
+
+    if name == "tEXt" then return Ok(Text(key, latin1(body[rest..]), false, false, "", ""))
+
+    if name == "zTXt"
+        if rest >= body.len || body[rest] != 0 then return Err(BadChunk(name))
+
+        val unpacked = inflate.zlib_any(body[rest + 1..])?
+
+        return Ok(Text(key, latin1(unpacked), false, true, "", ""))
+
+    // iTXt: a compression flag and method, a language tag, the keyword translated, and the text,
+    // the last two in UTF-8.
+    if rest + 2 > body.len then return Err(BadChunk(name))
+
+    val compressed = body[rest] == 1
+
+    if body[rest] > 1 || body[rest + 1] != 0 then return Err(BadChunk(name))
+
+    var at = rest + 2
+    val lang_start = at
+
+    while at < body.len && body[at] != 0
+        at += 1
+
+    if at == body.len then return Err(BadChunk(name))
+
+    val language = latin1(body[lang_start..<at])
+
+    at += 1
+
+    val tr_start = at
+
+    while at < body.len && body[at] != 0
+        at += 1
+
+    if at == body.len then return Err(BadChunk(name))
+
+    val translated = from_utf8(body[tr_start..<at]).map_err((e) -> BadChunk(name))?
+    val raw = body[at + 1..]
+    val bytes = if compressed then inflate.zlib_any(raw)? else raw
+    val text = from_utf8(bytes).map_err((e) -> BadChunk(name))?
+
+    Ok(Text(key, text, true, compressed, language, translated))
+end text_of
+
+private profile_of(body: []const u8) -> Result[Profile, Fault]
+    val (name, rest) = keyword(body, "iCCP")?
+
+    if rest >= body.len || body[rest] != 0 then return Err(BadChunk("iCCP"))
+
+    Ok(Profile(name, inflate.zlib_any(body[rest + 1..])?))
+end profile_of
+
+// The seven passes of Adam7: where each starts and how far apart its pixels are, across and down.
+private[png] val pass_x0: [7]usize = [0, 4, 0, 2, 0, 1, 0]
+private[png] val pass_y0: [7]usize = [0, 0, 4, 0, 2, 0, 1]
+private[png] val pass_dx: [7]usize = [8, 8, 4, 4, 2, 2, 1]
+private[png] val pass_dy: [7]usize = [8, 8, 8, 4, 4, 2, 2]
+
+// How many pixels of a `size`-pixel line a pass starting at `start` and stepping `step` takes.
+private[png] pass_len(size: usize, start: usize, step: usize) -> usize =
+    if size > start then (size - start + step - 1) / step else 0
+
+// The bytes a whole image's filtered rows take, every pass of it if interlaced: a filter byte and a
+// row per row, and nothing at all for a pass that is empty.
+private[png] filtered_size(w: usize, h: usize, kind: u8, depth: u8, interlaced: bool) -> usize
+    if !interlaced then return h * (1 + row_bytes_of(w, kind, depth))
+
+    var n: usize = 0
+
+    for p in 0..<7usize
+        val pw = pass_len(w, pass_x0[p], pass_dx[p])
+        val ph = pass_len(h, pass_y0[p], pass_dy[p])
+
+        if pw > 0 && ph > 0 then n += ph * (1 + row_bytes_of(pw, kind, depth))
+
+    n
+end filtered_size
+
+// The compressed pixels unpacked, unfiltered and, if they were interlaced, put back in place:
+// whole rows of samples with no filter bytes.
+private unpack(z: []const u8, w: usize, h: usize, kind: u8, depth: u8, interlaced: bool) -> Result[[]u8, Fault]
+    val need = filtered_size(w, h, kind, depth, interlaced)
     val raw: []u8 = [0; need]
 
-    inflate.zlib(zbuf[..<zn], raw) match
+    inflate.zlib(z, raw) match
+        Err(inflate.NoRoom) ->
+            val got = inflate.zlib_any(z)?
+
+            return Err(WrongSize(need, got.len))
         Err(e) -> return Err(Squashed(e))
         Ok(n) ->
             if n != need then return Err(WrongSize(need, n))
 
-    unfilter(raw, stride, height, channels)?
+    val bits = channels_of(kind) * usize(depth)
+    val bpp = if bits < 8 then 1 else bits / 8
+    val rb = row_bytes_of(w, kind, depth)
+    val data: []u8 = [0; h * rb]
 
-    Ok(Image(width, height, kind, raw, palette))
-end decode
+    if !interlaced
+        unfilter(raw, 1 + rb, h, bpp)?
 
-// Undo the per-row filters, in place. Each row was encoded as the difference between its samples
-// and a prediction made from the sample to the left (`a`), the one above (`b`), and the one above
-// and to the left (`c`), so decoding walks forward and reads the answers it has already written.
+        for y in 0..<h
+            copy(data[y * rb..<(y + 1) * rb], raw[y * (1 + rb) + 1..<(y + 1) * (1 + rb)])
+
+        return Ok(data)
+
+    var base: usize = 0
+
+    for p in 0..<7usize
+        val pw = pass_len(w, pass_x0[p], pass_dx[p])
+        val ph = pass_len(h, pass_y0[p], pass_dy[p])
+
+        if pw == 0 || ph == 0 then continue
+
+        val prb = row_bytes_of(pw, kind, depth)
+        val stride = 1 + prb
+
+        unfilter(raw[base..<base + ph * stride], stride, ph, bpp)?
+
+        for py in 0..<ph
+            val from = base + py * stride + 1
+            val to = (pass_y0[p] + py * pass_dy[p]) * rb
+
+            for px in 0..<pw
+                val x = pass_x0[p] + px * pass_dx[p]
+
+                if bits >= 8
+                    for k in 0..<bpp
+                        data[to + x * bpp + k] = raw[from + px * bpp + k]
+                else
+                    put_bits(data, to, x, bits, get_bits(raw, from, px, bits))
+
+        base += ph * stride
+
+    Ok(data)
+end unpack
+
+// Pixel `i` of a row of pixels narrower than a byte, packed from the most significant bit.
+private[png] get_bits(b: []const u8, row: usize, i: usize, bits: usize) -> u8
+    val bit = i * bits
+
+    b[row + bit / 8] >> u8(8 - bits - bit % 8) & u8((1 << bits) - 1)
+
+private[png] put_bits(b: []u8, row: usize, i: usize, bits: usize, v: u8)
+    val bit = i * bits
+
+    b[row + bit / 8] |= v << u8(8 - bits - bit % 8)
+
+// Undo the per-row filters, in place. Each row was encoded as the difference between its bytes and
+// a prediction made from the byte one pixel to the left (`a`), the one above (`b`), and the one
+// above and to the left (`c`), so decoding walks forward and reads the answers it has already
+// written. A pixel narrower than a byte counts as one byte here, which is the format's rule.
 //
 // All of it is modulo 256 by definition — the encoder subtracted in a byte and the decoder adds in
 // one. Paeth is the exception that has to leave: its choice between the three neighbours is made in
 // arithmetic wide enough to hold `a + b - c` and the three distances, and only the answer narrows.
-private unfilter(raw: []u8, stride: usize, height: usize, channels: usize) -> Result[unit, Fault]
+private unfilter(raw: []u8, stride: usize, height: usize, bpp: usize) -> Result[unit, Fault]
+    val n = stride - 1
+
     for y in 0..<height
-        var row = y * stride
-        var kind = raw[row]
+        val row = y * stride + 1
+        val up = if y > 0 then row - stride else 0
+        val kind = raw[row - 1]
 
-        if kind > 4 then return Err(BadFilter(kind, y))
+        kind match
+            0 -> ()
+            1 ->
+                for i in bpp..<n
+                    raw[row + i] += raw[row + i - bpp]
+            2 ->
+                if y > 0
+                    for i in 0..<n
+                        raw[row + i] += raw[up + i]
+            3 ->
+                for i in 0..<n
+                    val a = if i >= bpp then u32(raw[row + i - bpp]) else 0
+                    val b = if y > 0 then u32(raw[up + i]) else 0
 
-        for i in 0..<stride - 1
-            var x = int(raw[row + 1 + i])
-            var a = if i >= channels then int(raw[row + 1 + i - channels]) else 0
-            var b = if y > 0 then int(raw[row + 1 + i - stride]) else 0
-            var c = if i >= channels && y > 0 then int(raw[row + 1 + i - stride - channels]) else 0
+                    raw[row + i] += u8((a + b) >> 1)
+            4 ->
+                for i in 0..<n
+                    val a = if i >= bpp then int(raw[row + i - bpp]) else 0
+                    val b = if y > 0 then int(raw[up + i]) else 0
+                    val c = if i >= bpp && y > 0 then int(raw[up + i - bpp]) else 0
 
-            var predicted = kind match
-                0 -> 0
-                1 -> a
-                2 -> b
-                3 -> (a + b) >> 1
-                else paeth(a, b, c)
-
-            raw[row + 1 + i] = u8(x + predicted & 255)
+                    raw[row + i] += u8(paeth(a, b, c))
+            else return Err(BadFilter(kind, y))
 
     Ok(())
 end unfilter
 
 // The predictor that made PNG compress as well as it does: of the three neighbours, the one closest
 // to the plane they define between them.
-private paeth(a: int, b: int, c: int) -> int
+private[png] paeth(a: int, b: int, c: int) -> int
     var p = a + b - c
     var da = (p - a).abs()
     var db = (p - b).abs()

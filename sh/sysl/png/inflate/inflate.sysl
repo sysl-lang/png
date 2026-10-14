@@ -15,6 +15,8 @@
 
 module sh.sysl.png.inflate
 
+import sysl.slices.copy
+
 // The sizes the format fixes. Every one of them is a number the specification chose, and naming
 // them is what lets an array's bound and the loop that fills it be the same word rather than two
 // literals a reader has to check against each other.
@@ -25,6 +27,11 @@ const max_code: usize = 19         // the code-length alphabet the other two arr
 const fixed_lit: usize = 288       // the fixed table is declared over two more than are used
 const max_lengths: usize = max_lit + max_dist
 const max_length_codes: usize = max_lit - 257
+
+// How many bits of a code are looked up at once. A code this short or shorter is decoded by one
+// lookup; a longer one, which a block gives only to its rarest symbols, is walked a bit at a time.
+const fast_bits: usize = 10
+const fast_size: usize = 1 << 10
 
 // The tables the format itself fixes. They are `val`s rather than constants because a constant is
 // folded into its uses and has no address, and these are indexed by a symbol that is only known
@@ -98,20 +105,31 @@ impl Display for Fault
 
 // The zlib checksum: two running sums, the second over the first, both taken modulo the largest
 // prime below 65536. Cheap where a CRC is thorough, which is the trade the wrapper format made.
+//
+// The remainder is taken once per 5,552 bytes rather than once per byte: that is the longest run
+// over which the second sum, starting just under the modulus, cannot pass what a `u32` holds.
 adler32(data: []const u8) -> u32
     var a: u32 = 1
     var b: u32 = 0
+    var at: usize = 0
 
-    for x in data
-        a = (a + u32(x)) % 65521
-        b = (b + a) % 65521
+    while at < data.len
+        val end = if data.len - at > 5552 then at + 5552 else data.len
+
+        for x in data[at..<end]
+            a += u32(x)
+            b += a
+
+        a %= 65521
+        b %= 65521
+        at = end
 
     b << 16 | a
 end adler32
 
 // A zlib stream: two header bytes, a deflate stream, and a big-endian checksum of everything the
 // deflate stream produced. Returns how many bytes were written.
-zlib(src: []u8, out: []u8) -> Result[usize, Fault]
+zlib(src: []const u8, out: []u8) -> Result[usize, Fault]
     if src.len < 6 then return Err(Truncated)
 
     var cmf = src[0]
@@ -135,104 +153,187 @@ zlib(src: []u8, out: []u8) -> Result[usize, Fault]
     Ok(n)
 end zlib
 
+/** A zlib stream whose unpacked size is not known beforehand, unpacked into storage of its own.
+ *
+ * The room starts at four times the source and doubles whenever the stream needs more, up to
+ * `limit` bytes, past which the answer is `NoRoom` — which is what a caller unpacking somebody
+ * else's metadata wants rather than whatever a hostile stream asks for.
+ */
+zlib_any(src: []const u8, limit: usize = 1 << 28) -> Result[[]u8, Fault]
+    var room = if src.len * 4 < 1024 then 1024 else src.len * 4
+
+    loop
+        if room > limit then room = limit
+
+        val out: []u8 = [0; room]
+
+        zlib(src, out) match
+            Ok(n) -> return Ok(out[..<n])
+            Err(NoRoom) ->
+                if room == limit then return Err(NoRoom)
+            Err(e) -> return Err(e)
+
+        room *= 2
+end zlib_any
+
 // A bare deflate stream, with no wrapper and no checksum.
-raw(src: []u8, out: []u8) -> Result[usize, Fault]
+raw(src: []const u8, out: []u8) -> Result[usize, Fault]
     var inf = Inf(src, out, 0, 0, 0, 0)
 
     inf.blocks()?
     Ok(inf.n)
 
-private be32(b: []u8, i: usize) -> u32
+private be32(b: []const u8, i: usize) -> u32
     u32(b[i]) << 24 | u32(b[i + 1]) << 16 | u32(b[i + 2]) << 8 | u32(b[i + 3])
+
+/** One block's code for one alphabet, in the two forms a decoder wants.
+ *
+ * `counts` and `symbols` are the canonical form — how many codes each length has, and the symbols in
+ * code order — which is enough to decode any code a bit at a time. `fast` is the same code indexed
+ * by its next ten bits as they arrive, least significant first: each entry is the symbol shifted up
+ * four bits with the code's length below it, or zero where the code is longer than ten bits (or is
+ * no code at all, in a table the lengths leave incomplete), which sends the decoder to the slow way.
+ */
+private struct Table
+    counts: [16]u16
+    symbols: [288]u16
+    fast: [1024]u16
 
 // Fill in a table from a list of code lengths. The check that matters is the one for a table that
 // is *over*-subscribed — lengths needing more codes than a binary tree of that depth has room for —
 // because such a table decodes garbage rather than failing.
-//
-// The three arrays arrive as slices of the caller's locals rather than as a `Table` struct, and
-// that is not a preference. A table is two arrays whose sizes differ between the two tables a block
-// carries; a struct holding the larger pair would be copied at every call and a reference to one
-// would have to be allocated. Slices of somebody else's storage are what the language offers for
-// "look at these bytes, do not own them", and here that is exactly the relationship.
-private table(counts: []u16, symbols: []u16, lengths: []u8, n: usize) -> Result[unit, Fault]
+private build(t: *Table, lengths: []const u8) -> Result[unit, Fault]
     for i in 0..max_bits
-        counts[i] = 0
+        t.counts[i] = 0
 
-    for i in 0..<n
-        counts[usize(lengths[i])] += 1
+    for l in lengths
+        t.counts[usize(l)] += 1
+
+    t.counts[0] = 0
 
     var left = 1
 
-    for len in 1..int(max_bits)
-        left = left << 1 - int(counts[len])
+    for len in 1..max_bits
+        left = left << 1 - int(t.counts[len])
 
         if left < 0 then return Err(BadTable)
 
     var offset: [max_bits + 1]usize
+    var next: [max_bits + 1]u32
+    var code: u32 = 0
 
-    for len in 1..<int(max_bits)
-        offset[len + 1] = offset[len] + usize(counts[len])
+    for len in 1..<max_bits
+        offset[len + 1] = offset[len] + usize(t.counts[len])
 
-    for i in 0..<n
-        if lengths[i] != 0
-            symbols[offset[usize(lengths[i])]] = u16(i)
-            offset[usize(lengths[i])] += 1
+    for len in 1..max_bits
+        code = (code + u32(t.counts[len - 1])) << 1
+        next[len] = code
+
+    for i in 0..<fast_size
+        t.fast[i] = 0
+
+    for i in 0..<lengths.len
+        val len = usize(lengths[i])
+
+        if len != 0
+            t.symbols[offset[len]] = u16(i)
+            offset[len] += 1
+
+            // The code counted from its first bit, which is the order the stream delivers it in,
+            // entered at every slot whose low bits are the code.
+            if len <= fast_bits
+                var c = next[len]
+                var rev: usize = 0
+
+                for k in 0..<len
+                    rev = rev << 1 | usize(c & 1)
+                    c >>= 1
+
+                while rev < fast_size
+                    t.fast[rev] = u16(i << 4 | len)
+                    rev += 1 << len
+
+            next[len] += 1
 
     Ok(())
-end table
+end build
 
 // The whole of the decoder's state: where it is reading, where it is writing, and the bits it has
 // pulled out of the source but not yet handed to anybody.
+//
+// `pos` runs past the end of the source when the accumulator is topped up there: what it takes in
+// beyond the end is zero bits that are not in the stream, and every read checks that it has not
+// spent one of them, which is how a stream cut short is told from one that is merely nearly done.
 private struct Inf
-    src: []u8
+    src: []const u8
     out: []u8
     pos: usize
-    acc: u32
+    acc: u64
     cnt: u32
     n: usize
+
+    // Top the accumulator up to at least 57 bits.
+    @inline
+    fill(*self)
+        while self.cnt <= 56
+            val b = if self.pos < self.src.len then u64(self.src[self.pos]) else 0
+
+            self.acc |= b << u64(self.cnt)
+            self.pos += 1
+            self.cnt += 8
+    end fill
+
+    // Spend `k` bits, failing if any of them lay beyond the end of the source.
+    @inline
+    drop(*self, k: u32) -> Result[unit, Fault]
+        self.acc >>= u64(k)
+        self.cnt -= k
+
+        if self.pos * 8 - usize(self.cnt) > self.src.len * 8 then return Err(Truncated)
+
+        Ok(())
+    end drop
 
     // Bits arrive at the bottom of the accumulator and leave from the bottom, so a value spanning
     // two bytes assembles itself with no special case. The mask needs no parentheses: a shift binds
     // like a multiplication here rather than looser than addition as it does in C, so
     // `1 << k - 1` is the mask and not the shift of a decrement.
+    @inline
     bits(*self, k: u32) -> Result[u32, Fault]
-        while self.cnt < k
-            if self.pos >= self.src.len then return Err(Truncated)
+        if self.cnt < k then self.fill()
 
-            self.acc |= u32(self.src[self.pos]) << self.cnt
-            self.pos += 1
-            self.cnt += 8
+        val v = u32(self.acc & u64(1) << u64(k) - 1)
 
-        var v = self.acc & 1 << k - 1
-
-        self.acc >>= k
-        self.cnt -= k
+        self.drop(k)?
         Ok(v)
     end bits
 
-    put(*self, b: u8) -> Result[unit, Fault]
-        if self.n >= self.out.len then return Err(NoRoom)
+    // A symbol under the table: one lookup when the code is ten bits or fewer, and otherwise the
+    // canonical walk, a bit at a time — at each length the codes of that length occupy a contiguous
+    // run starting at `first`, so a code that has not yet fallen inside its run has one more bit to
+    // collect.
+    @inline
+    symbol(*self, t: *Table) -> Result[usize, Fault]
+        if self.cnt < 15 then self.fill()
 
-        self.out[self.n] = b
-        self.n += 1
-        Ok(())
-    end put
+        val e = usize(t.fast[usize(self.acc & u64(fast_size - 1))])
 
-    // A canonical Huffman code, decoded a bit at a time. `counts[l]` is how many codes have length
-    // `l` and `symbols` lists the symbols in code order, which between them are enough: at each
-    // length, the codes of that length occupy a contiguous run starting at `first`, so a code that
-    // has not yet fallen inside its run has one more bit to collect.
-    symbol(*self, counts: []u16, symbols: []u16) -> Result[int, Fault]
+        if e != 0
+            self.drop(u32(e & 15))?
+            return Ok(e >> 4)
+
         var code = 0
         var first = 0
         var index = 0
 
-        for len in 1..int(max_bits)
-            code |= int(self.bits(1)?)
+        for len in 1..max_bits
+            code |= int(self.acc >> u64(len - 1) & 1)
 
-            var count = int(counts[len])
+            var count = int(t.counts[len])
 
-            if code - count < first then return Ok(int(symbols[index + code - first]))
+            if code - count < first
+                self.drop(u32(len))?
+                return Ok(usize(t.symbols[index + code - first]))
 
             index += count
             first = (first + count) << 1
@@ -241,9 +342,11 @@ private struct Inf
         Err(BadSymbol)
     end symbol
 
-    // An uncompressed block. The bit accumulator is discarded rather than drained: what is left in
-    // it is padding to the next byte boundary by definition.
+    // An uncompressed block. What is left in the accumulator of the current byte is padding to the
+    // next boundary by definition; whole bytes it took in ahead are handed back to the source.
     stored(*self) -> Result[unit, Fault]
+        self.drop(self.cnt % 8)?
+        self.pos -= usize(self.cnt / 8)
         self.acc = 0
         self.cnt = 0
 
@@ -256,10 +359,10 @@ private struct Inf
 
         if len + nlen != 65535 then return Err(BadStored)
         if self.pos + len > self.src.len then return Err(Truncated)
+        if self.n + len > self.out.len then return Err(NoRoom)
 
-        for i in 0..<len
-            self.put(self.src[self.pos + i])?
-
+        copy(self.out[self.n..<self.n + len], self.src[self.pos..<self.pos + len])
+        self.n += len
         self.pos += len
         Ok(())
     end stored
@@ -272,18 +375,16 @@ private struct Inf
         for i in 0..<fixed_lit
             lengths[i] = if i < 144 then 8 else if i < 256 then 9 else if i < 280 then 7 else 8
 
-        var lcounts: [max_bits + 1]u16
-        var lsymbols: [fixed_lit]u16
-        var dcounts: [max_bits + 1]u16
-        var dsymbols: [max_dist]u16
+        var lit: Table
+        var dist: Table
 
-        table(lcounts, lsymbols, lengths, fixed_lit)?
+        build(&lit, lengths)?
 
         for i in 0..<max_dist
             lengths[i] = 5
 
-        table(dcounts, dsymbols, lengths, max_dist)?
-        self.codes(lcounts, lsymbols, dcounts, dsymbols)
+        build(&dist, lengths[..<max_dist])?
+        self.codes(&lit, &dist)
     end fixed
 
     // A block carrying its own two tables, themselves Huffman-coded by a third table whose lengths
@@ -300,10 +401,9 @@ private struct Inf
         for i in 0..<ncode
             lengths[order[i]] = u8(self.bits(3)?)
 
-        var ccounts: [max_bits + 1]u16
-        var csymbols: [max_code]u16
+        var clen: Table
 
-        table(ccounts, csymbols, lengths, max_code)?
+        build(&clen, lengths[..<max_code])?
 
         // The lengths of the two real tables, run-length coded: 16 repeats the previous length,
         // 17 and 18 are runs of zeroes of two different sizes.
@@ -313,7 +413,7 @@ private struct Inf
         var i: usize = 0
 
         while i < nlen + ndist
-            var sym = self.symbol(ccounts, csymbols)?
+            var sym = self.symbol(&clen)?
 
             if sym < 16
                 lengths[i] = u8(sym)
@@ -339,45 +439,144 @@ private struct Inf
 
                 i += count
 
-        var lcounts: [max_bits + 1]u16
-        var lsymbols: [max_lit]u16
-        var dcounts: [max_bits + 1]u16
-        var dsymbols: [max_dist]u16
+        var lit: Table
+        var dist: Table
 
-        table(lcounts, lsymbols, lengths, nlen)?
-        table(dcounts, dsymbols, lengths[nlen..<nlen + ndist], ndist)?
-        self.codes(lcounts, lsymbols, dcounts, dsymbols)
+        build(&lit, lengths[..<nlen])?
+        build(&dist, lengths[nlen..<nlen + ndist])?
+        self.codes(&lit, &dist)
     end dynamic
+
+    // A fault, unless the bits that led to it were not in the stream: a stream cut short decodes
+    // zeroes past its end, and whatever those zeroes appear to say, what is wrong is the cut.
+    private failed(self, f: Fault) -> Fault =
+        if self.pos * 8 - usize(self.cnt) > self.src.len * 8 then Truncated else f
 
     // The loop both coded block kinds share: literals go straight out, and a length symbol is
     // followed by a distance, naming a run of bytes already written to copy again.
-    codes(*self, lcounts: []u16, lsymbols: []u16, dcounts: []u16, dsymbols: []u16) -> Result[unit, Fault]
+    //
+    // **This is the loop the decoder's time goes in, so it keeps the bit accumulator in locals** and
+    // writes it back only around the rare slow path, and it tops the accumulator up once per symbol
+    // to 48 bits or more — enough for the longest code, its extra bits, a distance code and its extra
+    // bits together — eight bytes at a time while eight remain. Whether the stream ran out is asked
+    // once, at the end of the block or at a fault, rather than at every bit spent.
+    codes(*self, lit: *Table, dist: *Table) -> Result[unit, Fault]
+        val src = self.src
+        val out = self.out
+        var acc = self.acc
+        var cnt = self.cnt
+        var pos = self.pos
+        var n = self.n
+
         loop
-            var sym = self.symbol(lcounts, lsymbols)?
+            if cnt < 48
+                if pos + 8 <= src.len
+                    val w = u64(src[pos]) | u64(src[pos + 1]) << 8 | u64(src[pos + 2]) << 16 |
+                        u64(src[pos + 3]) << 24 | u64(src[pos + 4]) << 32 | u64(src[pos + 5]) << 40 |
+                        u64(src[pos + 6]) << 48 | u64(src[pos + 7]) << 56
+
+                    acc |= w << u64(cnt)
+                    pos += usize(63 - cnt) >> 3
+                    cnt |= 56
+                else
+                    while cnt <= 56
+                        val b = if pos < src.len then u64(src[pos]) else 0
+
+                        acc |= b << u64(cnt)
+                        pos += 1
+                        cnt += 8
+
+            var sym: usize = 0
+            val e = usize(lit.fast[usize(acc & u64(fast_size - 1))])
+
+            if e != 0
+                acc >>= u64(e & 15)
+                cnt -= u32(e & 15)
+                sym = e >> 4
+            else
+                self.acc = acc
+                self.cnt = cnt
+                self.pos = pos
+                sym = self.symbol(lit)?
+                acc = self.acc
+                cnt = self.cnt
 
             if sym < 256
-                self.put(u8(sym))?
+                if n >= out.len
+                    self.n = n
+                    return Err(self.failed(NoRoom))
+
+                out[n] = u8(sym)
+                n += 1
             else if sym == 256
+                self.acc = acc
+                self.cnt = cnt
+                self.pos = pos
+                self.n = n
+
+                if self.failed(BadBlock) is Truncated then return Err(Truncated)
+
                 return Ok(())
             else
                 sym -= 257
 
-                if sym >= int(max_length_codes) then return Err(BadLength(sym + 257))
+                self.acc = acc
+                self.cnt = cnt
+                self.pos = pos
 
-                var len = lbase[sym] + usize(self.bits(lextra[sym])?)
-                var dsym = self.symbol(dcounts, dsymbols)?
+                if sym >= max_length_codes then return Err(self.failed(BadLength(int(sym) + 257)))
 
-                if dsym >= int(max_dist) then return Err(BadLength(dsym + 257))
+                val le = lextra[sym]
+                val len = lbase[sym] + usize(acc & (u64(1) << u64(le)) - 1)
 
-                var dist = dbase[dsym] + usize(self.bits(dextra[dsym])?)
+                acc >>= u64(le)
+                cnt -= le
 
-                if dist > self.n then return Err(BadDistance(dist))
+                var dsym: usize = 0
+                val f = usize(dist.fast[usize(acc & u64(fast_size - 1))])
+
+                if f != 0
+                    acc >>= u64(f & 15)
+                    cnt -= u32(f & 15)
+                    dsym = f >> 4
+                else
+                    self.acc = acc
+                    self.cnt = cnt
+                    dsym = self.symbol(dist)?
+                    acc = self.acc
+                    cnt = self.cnt
+
+                self.acc = acc
+                self.cnt = cnt
+
+                if dsym >= max_dist then return Err(self.failed(BadLength(int(dsym) + 257)))
+
+                val de = dextra[dsym]
+                val d = dbase[dsym] + usize(acc & (u64(1) << u64(de)) - 1)
+
+                acc >>= u64(de)
+                cnt -= de
+
+                if d > n
+                    self.cnt = cnt
+                    return Err(self.failed(BadDistance(d)))
+
+                if n + len > out.len
+                    self.n = n
+                    return Err(self.failed(NoRoom))
 
                 // The copy reads through what it is writing, so a distance of one repeats a single
                 // byte for the whole run. Every run-length encoding deflate does arrives this way,
-                // and a decoder that copied the source range first would get it wrong.
-                for k in 0..<len
-                    self.put(self.out[self.n - dist])?
+                // and a decoder that copied the source range first would get it wrong. A match
+                // reaching back at least its own length does not overlap itself, and that one is
+                // handed to `copy` whole.
+                if d >= len && len > 32
+                    copy(out[n..<n + len], out[n - d..<n - d + len])
+                    n += len
+                else
+                    for k in 0..<len
+                        out[n] = out[n - d]
+                        n += 1
     end codes
 
     blocks(*self) -> Result[unit, Fault]

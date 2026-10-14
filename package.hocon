@@ -1,35 +1,42 @@
-// A PNG reader for sysl, and the DEFLATE decoder underneath it.
+// A PNG reader and writer for sysl, and the DEFLATE decoder and compressor underneath them.
 //
 // A file goes in as bytes and an `Image` comes out, with the chunk layer, both checksums, the
-// deflate stream and the row filters done on the way. All five colour types are read at eight bits
-// a sample, and `at(x, y)` answers an `Rgba` whichever of them the file used.
+// deflate stream, the row filters and the interlacing done on the way; an `Image` goes back out as
+// a file the same way round. Every colour type is read and written at every depth it allows, and
+// `at(x, y)` answers an `Rgba` whichever of them the file used.
 //
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       png { git = "github.com/sysl-lang/png", version = "0.1.1" }
+//       png { git = "github.com/sysl-lang/png", version = "0.2.0" }
 //     }
 //
 // The coordinate names the package, `png`; the modules a program imports are `sh.sysl.png` and,
-// where raw DEFLATE is what is wanted and pictures are not, `sh.sysl.png.inflate`.
+// where raw DEFLATE is what is wanted and pictures are not, `sh.sysl.png.inflate` and
+// `sh.sysl.png.deflate`.
 
 package {
   name    = "png"
-  version = "0.1.1"
+  version = "0.2.0"
 
-  // **The oldest compiler this builds with.** `decode` sizes its intermediate buffers with a `[]T`
-  // declared with a length computed while running, from a header it has just read rather than making
-  // the caller guess and be told `NoRoom`; those buffers are `val`s, which relies on a `val`-bound
-  // slice being writable through.
-  sysl = "0.1.0-alpha.8"
+  // **The oldest compiler this builds with**, raised to the one it was last built and tested with.
+  sysl = "0.1.0-alpha.12"
 }
 
 // **`heap = true`, and it is the intermediate storage rather than the image.** `decode` gathers the
 // `IDAT` chunks into one buffer and unpacks them into another, and neither length is known until the
-// header has been read -- which happens inside. The `Image` that comes out owns the unpacked rows.
+// header has been read -- which happens inside. The `Image` that comes out owns the unpacked rows,
+// and a written file is gathered in a `Buf`.
 //
 // **What is NOT here is `os` or `posix`.** This package opens nothing: a caller hands over bytes it
-// already has, and where they came from is the program's business.
+// already has, and where they came from is the program's business. The tests read PngSuite from
+// disk and run `pngcheck` and `python3`, but a consumer never builds them.
 requires {
   heap = true
+}
+
+// The second decoder every pixel is checked against: stb_image, through the org's binding. A test
+// needs it and nothing else does, so a consumer never fetches it.
+dev_dependencies {
+  stb { git = "github.com/sysl-lang/stb", version = "0.1.0" }
 }

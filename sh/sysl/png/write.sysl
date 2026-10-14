@@ -1,0 +1,372 @@
+/** The PNG writer: an `Image` in, a file's bytes out.
+ *
+ * The reader's steps run backwards. The rows are split into Adam7's seven passes if the file is to be
+ * interlaced, each row is filtered — by the filter asked for, or by the one that makes the row
+ * smallest by the standard heuristic — and the lot is compressed by `sh.sysl.png.deflate` and cut
+ * into `IDAT` chunks of a chosen size, with the header, the palette, the transparency and whichever
+ * ancillary chunks the image's `info` holds around them.
+ */
+module sh.sysl.png
+
+import sh.sysl.png.deflate
+import sysl.buf.{Buf, buf}
+
+/** How the rows are filtered. `Adaptive` filters each row all five ways and keeps the one whose
+ * bytes, read as signed, sum smallest in magnitude — the heuristic the PNG specification
+ * recommends — except where the specification recommends no filtering at all: a palette, or
+ * samples narrower than a byte.
+ */
+enum Filter
+    Nothing
+    Sub
+    Up
+    Average
+    Paeth
+    Adaptive
+
+/** How to write a file. `level` is the deflate level, 0 to 9; `chunk` the most image data one
+ * `IDAT` chunk carries.
+ */
+struct Options
+    level: int
+    filter: Filter
+    interlaced: bool
+    chunk: usize
+
+/** Level 6, adaptive filtering, not interlaced, and 64 KB `IDAT` chunks. */
+options() -> Options = Options(6, Filter.Adaptive, false, 65536)
+
+/** An image from raw rows: `data` laid out as `Image.data` is — each row `row_bytes` long, samples
+ * narrower than a byte packed from the top bit, sixteen-bit samples big-endian. Checked, so what
+ * comes back is an image `encode` will write; a palette or transparency is set on it afterwards.
+ */
+image(width: usize, height: usize, kind: u8, depth: u8, data: []u8) -> Result[Image, Fault]
+    if kind != 0 && kind != 2 && kind != 3 && kind != 4 && kind != 6 then return Err(BadColour(kind))
+    if !depth_allowed(kind, depth) then return Err(BadDepth(depth, kind))
+    if width == 0 || height == 0 || width > 0x7FFFFFFF || height > 0x7FFFFFFF then return Err(BadSize)
+
+    val need = height * row_bytes_of(width, kind, depth)
+
+    if data.len != need then return Err(WrongSize(need, data.len))
+
+    Ok(Image(width, height, kind, depth, false, data, [], [], false, [0, 0, 0], info()))
+end image
+
+// Everything about an image that would make a file of it broken, refused before a byte is written.
+private check(img: Image) -> Result[unit, Fault]
+    val kind = img.kind
+
+    if kind != 0 && kind != 2 && kind != 3 && kind != 4 && kind != 6 then return Err(BadColour(kind))
+    if !depth_allowed(kind, img.depth) then return Err(BadDepth(img.depth, kind))
+    if img.width == 0 || img.height == 0 then return Err(BadSize)
+    if img.width > 0x7FFFFFFF || img.height > 0x7FFFFFFF then return Err(BadSize)
+
+    val need = img.height * img.row_bytes()
+
+    if img.data.len != need then return Err(WrongSize(need, img.data.len))
+
+    if kind == 3
+        if img.palette.len == 0 then return Err(NoPalette)
+        if img.palette.len > 768 || img.palette.len % 3 != 0 then return Err(BadPalette(img.palette.len))
+        if img.alpha.len > img.palette.len / 3 then return Err(BadImage("has more alphas than colours"))
+
+        indexed(img)?
+    else if img.alpha.len > 0
+        return Err(BadImage("has palette alphas and no palette"))
+
+    if (kind == 0 || kind == 4) && img.palette.len > 0 then return Err(BadImage("is grey and has a palette"))
+
+    if img.keyed
+        if kind != 0 && kind != 2 then return Err(BadImage("has a transparent colour and no room for one"))
+
+        val top = if img.depth == 16 then 65535 else (1 << u32(img.depth)) - 1
+
+        for k in 0..<(if kind == 0 then 1 else 3)
+            if u32(img.key[k]) > top then return Err(BadImage("has a transparent colour it cannot hold"))
+
+    Ok(())
+end check
+
+/** Write `img` as a PNG file. */
+encode(img: Image, opts: Options = options()) -> Result[Buf[u8], Fault]
+    check(img)?
+
+    if opts.chunk == 0 || opts.chunk > 0x7FFFFFFF then return Err(BadImage("is to be cut into chunks of no size"))
+
+    var out: Buf[u8] = buf()
+    var crc = crc32_table()
+
+    out.extend([u8(137), 80, 78, 71, 13, 10, 26, 10])
+
+    var head: [13]u8
+
+    put32(head, 0, u32(img.width))
+    put32(head, 4, u32(img.height))
+    head[8] = img.depth
+    head[9] = img.kind
+    head[12] = if opts.interlaced then 1 else 0
+    chunk(out, &crc, "IHDR", head)
+
+    // The chunks that must come before the palette, then the rest of what must come before the
+    // image data.
+    val info = img.info
+
+    // The specification has an encoder write one or the other, and pngcheck holds it to that.
+    if info.srgb.is_some() && info.profile.is_some()
+        return Err(BadImage("has both an sRGB chunk and a colour profile"))
+
+    info.gamma match
+        Some(g) ->
+            var b: [4]u8
+
+            put32(b, 0, g)
+            chunk(out, &crc, "gAMA", b)
+        None -> ()
+
+    info.srgb match
+        Some(intent) ->
+            if intent > 3 then return Err(BadImage("has an sRGB rendering intent past 3"))
+
+            chunk(out, &crc, "sRGB", [intent])
+        None -> ()
+
+    info.profile match
+        Some(p) ->
+            var body: Buf[u8] = buf()
+
+            keyword_into(body, p.name, "iCCP")?
+            body.push(0)
+            body.push(0)
+            body.extend(deflate.zlib(p.data, opts.level).view())
+            chunk(out, &crc, "iCCP", body.view())
+        None -> ()
+
+    if img.palette.len > 0 then chunk(out, &crc, "PLTE", img.palette)
+
+    if img.kind == 3 && img.alpha.len > 0 then chunk(out, &crc, "tRNS", img.alpha)
+
+    if img.keyed
+        var t: [6]u8
+        val n = if img.kind == 0 then 1 else 3
+
+        for k in 0..<n
+            t[2 * k] = u8(img.key[k] >> 8)
+            t[2 * k + 1] = u8(img.key[k] & 255)
+
+        chunk(out, &crc, "tRNS", t[..<2 * n])
+
+    info.phys match
+        Some(p) ->
+            var b: [9]u8
+
+            put32(b, 0, p.x)
+            put32(b, 4, p.y)
+            b[8] = if p.metre then 1 else 0
+            chunk(out, &crc, "pHYs", b)
+        None -> ()
+
+    for t in info.texts
+        text_chunk(out, &crc, t, opts.level)?
+
+    val z = deflate.zlib(filtered(img, opts).view(), opts.level)
+    var at: usize = 0
+
+    loop
+        val n = if z.len() - at > opts.chunk then opts.chunk else z.len() - at
+
+        chunk(out, &crc, "IDAT", z.view()[at..<at + n])
+        at += n
+
+        if at == z.len() then break
+
+    chunk(out, &crc, "IEND", [])
+    Ok(out)
+end encode
+
+private[png] put32(b: []u8, at: usize, v: u32)
+    b[at] = u8(v >> 24)
+    b[at + 1] = u8(v >> 16 & 255)
+    b[at + 2] = u8(v >> 8 & 255)
+    b[at + 3] = u8(v & 255)
+
+// One chunk: its length, its name, its body, and the checksum of the name and the body together.
+private chunk(out: Buf[u8], crc: *Crc32, name: string, body: []const u8)
+    var len: [4]u8
+
+    put32(len, 0, u32(body.len))
+    out.extend(len)
+    out.extend(name.bytes)
+    out.extend(body)
+
+    var sum: [4]u8
+
+    put32(sum, 0, crc.feed(crc.feed(0xFFFFFFFF, name.bytes), body) ^ 0xFFFFFFFF)
+    out.extend(sum)
+end chunk
+
+// A keyword: one to 79 Latin-1 characters, no leading, trailing or doubled space, nothing below a
+// space and no non-breaking one, as the specification has it.
+private keyword_into(out: Buf[u8], word: string, chunk: string) -> Result[unit, Fault]
+    val start = out.len()
+    var last: u32 = 32
+
+    for c in word.chars
+        val v = u32(c)
+
+        if v < 32 || (v > 126 && v < 161) || v > 255 || (v == 32 && last == 32)
+            return Err(BadChunk(chunk))
+
+        out.push(u8(v))
+        last = v
+
+    val n = out.len() - start
+
+    if n == 0 || n > 79 || last == 32 then return Err(BadChunk(chunk))
+
+    Ok(())
+end keyword_into
+
+// A string as Latin-1, refused if it holds a character Latin-1 does not have.
+private latin1_into(out: Buf[u8], s: string, chunk: string) -> Result[unit, Fault]
+    for c in s.chars
+        if u32(c) > 255 then return Err(BadChunk(chunk))
+
+        out.push(u8(u32(c)))
+
+    Ok(())
+end latin1_into
+
+private text_chunk(out: Buf[u8], crc: *Crc32, t: Text, level: int) -> Result[unit, Fault]
+    var body: Buf[u8] = buf()
+
+    if t.international
+        keyword_into(body, t.keyword, "iTXt")?
+        body.push(0)
+        body.push(if t.compressed then 1 else 0)
+        body.push(0)
+        latin1_into(body, t.language, "iTXt")?
+        body.push(0)
+        body.extend(t.translated.bytes)
+        body.push(0)
+
+        if t.compressed
+            body.extend(deflate.zlib(t.text.bytes, level).view())
+        else
+            body.extend(t.text.bytes)
+
+        chunk(out, crc, "iTXt", body.view())
+    else if t.compressed
+        keyword_into(body, t.keyword, "zTXt")?
+        body.push(0)
+        body.push(0)
+
+        var text: Buf[u8] = buf()
+
+        latin1_into(text, t.text, "zTXt")?
+        body.extend(deflate.zlib(text.view(), level).view())
+        chunk(out, crc, "zTXt", body.view())
+    else
+        keyword_into(body, t.keyword, "tEXt")?
+        body.push(0)
+        latin1_into(body, t.text, "tEXt")?
+        chunk(out, crc, "tEXt", body.view())
+
+    Ok(())
+end text_chunk
+
+// The image's rows filtered and, if asked, interlaced: what the reader's `unpack` takes apart.
+private filtered(img: Image, opts: Options) -> Buf[u8]
+    val bits = img.channels() * usize(img.depth)
+    val bpp = if bits < 8 then 1 else bits / 8
+
+    // The specification's own advice: a palette or a sample narrower than a byte filters worse than
+    // it does not filter.
+    val filter = if opts.filter == Filter.Adaptive && (img.kind == 3 || img.depth < 8) then Filter.Nothing else opts.filter
+    var out: Buf[u8] = buf()
+
+    if !opts.interlaced
+        filter_rows(out, img.data, img.row_bytes(), img.height, bpp, filter)
+        return out
+
+    val rb = img.row_bytes()
+
+    for p in 0..<7usize
+        val pw = pass_len(img.width, pass_x0[p], pass_dx[p])
+        val ph = pass_len(img.height, pass_y0[p], pass_dy[p])
+
+        if pw == 0 || ph == 0 then continue
+
+        val prb = row_bytes_of(pw, img.kind, img.depth)
+        val pass: []u8 = [0; ph * prb]
+
+        for py in 0..<ph
+            val from = (pass_y0[p] + py * pass_dy[p]) * rb
+            val to = py * prb
+
+            for px in 0..<pw
+                val x = pass_x0[p] + px * pass_dx[p]
+
+                if bits >= 8
+                    for k in 0..<bpp
+                        pass[to + px * bpp + k] = img.data[from + x * bpp + k]
+                else
+                    put_bits(pass, to, px, bits, get_bits(img.data, from, x, bits))
+
+        filter_rows(out, pass, prb, ph, bpp, filter)
+
+    out
+end filtered
+
+// Filter `height` rows of `rb` bytes, each behind its filter byte.
+private filter_rows(out: Buf[u8], data: []const u8, rb: usize, height: usize, bpp: usize, filter: Filter)
+    val cand: []u8 = [0; 5 * rb]
+
+    for y in 0..<height
+        val row = y * rb
+        var best: usize = 0
+
+        if filter == Filter.Adaptive
+            var least: usize = 0
+
+            for f in 0..<5usize
+                val sum = filter_row(cand[f * rb..<(f + 1) * rb], data, row, rb, y, bpp, f)
+
+                if f == 0 || sum < least
+                    least = sum
+                    best = f
+        else
+            best = filter match
+                Nothing -> 0
+                Sub -> 1
+                Up -> 2
+                Average -> 3
+                else 4
+
+            filter_row(cand[best * rb..<(best + 1) * rb], data, row, rb, y, bpp, best)
+
+        out.push(u8(best))
+        out.extend(cand[best * rb..<(best + 1) * rb])
+end filter_rows
+
+// One row filtered one way into `dst`, answering the sum of its bytes' magnitudes read as signed.
+private filter_row(dst: []u8, data: []const u8, row: usize, rb: usize, y: usize, bpp: usize, f: usize) -> usize
+    var sum: usize = 0
+
+    for i in 0..<rb
+        val x = data[row + i]
+        val a = if i >= bpp then data[row + i - bpp] else 0
+        val b = if y > 0 then data[row + i - rb] else 0
+        val c = if i >= bpp && y > 0 then data[row + i - rb - bpp] else 0
+
+        val v = f match
+            0 -> x
+            1 -> x - a
+            2 -> x - b
+            3 -> x - u8((u32(a) + u32(b)) >> 1)
+            else x - u8(paeth(int(a), int(b), int(c)))
+
+        dst[i] = v
+        sum += if v < 128 then usize(v) else 256 - usize(v)
+
+    sum
+end filter_row
