@@ -20,7 +20,7 @@ package {
   version = "0.2.0"
 
   // **The oldest compiler this builds with**, raised to the one it was last built and tested with.
-  sysl = "0.1.0-alpha.12"
+  sysl = "0.6.0"
 }
 
 // **`heap = true`, and it is the intermediate storage rather than the image.** `decode` gathers the
@@ -38,5 +38,5 @@ requires {
 // The second decoder every pixel is checked against: stb_image, through the org's binding. A test
 // needs it and nothing else does, so a consumer never fetches it.
 dev_dependencies {
-  stb { git = "github.com/sysl-lang/stb", version = "0.1.0" }
+  stb { git = "github.com/sysl-lang/stb", version = "0.1.1" }
 }

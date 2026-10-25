@@ -287,7 +287,7 @@ zlib_agrees()
     val words = split(out.text.trim(), " ")
 
     assert_eq(words[0], "ok")
-    assert_eq(words[1], str(files))
+    assert_eq(words[1], files.to_string())
     assert(words[2] <= "1.100",s"worst ratio ${words[2]} in ${words[3]}")
     remove_dir_all(dir).unwrap()
 end zlib_agrees

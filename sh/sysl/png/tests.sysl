@@ -172,7 +172,7 @@ private text_of(b: []u8, n: usize) -> string
     var s = ""
 
     for i in 0..<n
-        s += str(char(u32(b[i])))
+        s += char(u32(b[i])).to_string()
 
     s
 end text_of
@@ -259,7 +259,7 @@ private squares() -> string
     for i in 0..<60
         if i > 0 then s += " "
 
-        s += str(i * i)
+        s += (i * i).to_string()
 
     s
 end squares

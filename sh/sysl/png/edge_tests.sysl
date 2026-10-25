@@ -259,7 +259,7 @@ narrow_samples()
     var bits = ""
 
     for x in 0..<8usize
-        bits += str(one.sample(x, 0, 0))
+        bits += one.sample(x, 0, 0).to_string()
 
     assert_eq(bits, "10110001")
     assert_eq(one.at(0, 0).r, 255)

@@ -85,7 +85,7 @@ end Fault
 describe(f: Fault) -> string
     f match
         Truncated -> "the stream ends in the middle of something"
-        BadMethod(m) -> s"compression method ${str(m)} is not deflate"
+        BadMethod(m) -> s"compression method ${m.to_string()} is not deflate"
         BadWindow -> "a window wider than the format allows"
         BadFlags -> "the header's check bits do not agree"
         Preset -> "a stream wanting a dictionary it was not given"
@@ -93,8 +93,8 @@ describe(f: Fault) -> string
         BadStored -> "a stored block whose length and complement disagree"
         BadTable -> "a code table claiming more codes than its lengths leave room for"
         BadSymbol -> "a code that stands for nothing"
-        BadLength(s) -> s"length symbol ${str(s)} is past the end of the table"
-        BadDistance(d) -> s"a match reaching ${str(d)} bytes back, before anything was written"
+        BadLength(s) -> s"length symbol ${s.to_string()} is past the end of the table"
+        BadDistance(d) -> s"a match reaching ${d.to_string()} bytes back, before anything was written"
         NoRoom -> "no room left for what the stream unpacks to"
         BadChecksum(want, got) -> f"the checksum says ${want}%08x and the bytes say ${got}%08x"
 end describe

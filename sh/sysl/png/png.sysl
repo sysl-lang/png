@@ -67,24 +67,24 @@ end Fault
 describe(f: Fault) -> string
     f match
         NotPng -> "not a PNG at all"
-        Truncated(at) -> s"the file ends inside the chunk at ${str(at)}"
-        BadCrc(at) -> s"the chunk at ${str(at)} does not match its checksum"
+        Truncated(at) -> s"the file ends inside the chunk at ${at.to_string()}"
+        BadCrc(at) -> s"the chunk at ${at.to_string()} does not match its checksum"
         NoHeader -> "the header is not the first chunk"
         BadSize -> "an image with no pixels in it"
-        BadDepth(d, kind) -> s"${str(d)} bits a sample is not a depth colour type ${str(kind)} has"
-        BadColour(c) -> s"colour type ${str(c)} is not one of the five"
+        BadDepth(d, kind) -> s"${d.to_string()} bits a sample is not a depth colour type ${kind.to_string()} has"
+        BadColour(c) -> s"colour type ${c.to_string()} is not one of the five"
         BadCompression -> "compressed by something other than deflate"
         BadFilterMethod -> "filtered by a method this format does not have"
-        BadInterlace(m) -> s"interlace method ${str(m)} is not one the format has"
+        BadInterlace(m) -> s"interlace method ${m.to_string()} is not one the format has"
         Unknown(name) -> s"a chunk named '$name' that must be understood and is not"
         NoPalette -> "a paletted image with no palette"
-        BadPalette(len) -> s"a palette of ${str(len)} bytes, which is not one to 256 colours of three"
-        BadIndex(i) -> s"a pixel naming colour ${str(i)}, past the end of the palette"
+        BadPalette(len) -> s"a palette of ${len.to_string()} bytes, which is not one to 256 colours of three"
+        BadIndex(i) -> s"a pixel naming colour ${i.to_string()}, past the end of the palette"
         NoPixels -> "no image data"
         NoEnd -> "the last chunk is not the end chunk"
-        BadFilter(f, row) -> s"row ${str(row)} claims filter ${str(f)}"
+        BadFilter(f, row) -> s"row ${row.to_string()} claims filter ${f.to_string()}"
         Squashed(e) -> inflate.describe(e)
-        WrongSize(want, got) -> s"the rows need ${str(want)} bytes and the data unpacks to ${str(got)}"
+        WrongSize(want, got) -> s"the rows need ${want.to_string()} bytes and the data unpacks to ${got.to_string()}"
         Misplaced(name) -> s"a '$name' chunk where the format does not allow one"
         BadChunk(name) -> s"a '$name' chunk whose contents are not what that chunk holds"
         BadAnimation(why) -> s"an animation that $why"
@@ -363,7 +363,7 @@ private[png] name_of(b: []const u8, at: usize) -> string
     var s = ""
 
     for i in 0..<4usize
-        s += str(char(u32(b[at + i])))
+        s += char(u32(b[at + i])).to_string()
 
     s
 end name_of

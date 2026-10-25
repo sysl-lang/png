@@ -27,7 +27,7 @@ sh/sysl/png/
 testdata/
     pngsuite/           PngSuite, the format's conformance images
     apng/               two animations, and the script that wrote them
-package.hocon           who this package is, and what it needs of the machine
+sysl.hocon              who this package is, and what it needs of the machine
 ```
 
 The modules are **`sh.sysl.png`**, **`sh.sysl.png.inflate`** and **`sh.sysl.png.deflate`**, and the
@@ -35,7 +35,7 @@ directories are those names: a dotted module name mirrors its path from the libr
 
 ## Using it
 
-Name it in your project's `package.hocon` and `sysl build` fetches it:
+Name it in your project's `sysl.hocon` and `sysl build` fetches it:
 
 ```hocon
 dependencies {
@@ -49,11 +49,11 @@ import sh.sysl.png.{decode, encode, options}
 decode(bytes) match
     Err(f) -> print(s"not readable: $f")
     Ok(img) ->
-        print(s"${str(img.width)}x${str(img.height)}, type ${str(img.kind)}, ${str(img.depth)} bits")
+        print(s"${img.width.to_string()}x${img.height.to_string()}, type ${img.kind.to_string()}, ${img.depth.to_string()} bits")
 
         val p = img.at(0, 0)
 
-        print(s"${str(p.r)} ${str(p.g)} ${str(p.b)} ${str(p.a)}")
+        print(s"${p.r.to_string()} ${p.g.to_string()} ${p.b.to_string()} ${p.a.to_string()}")
 
         var o = options()
 
@@ -143,7 +143,7 @@ import sh.sysl.png.{deflate, inflate}
 val z = deflate.zlib(bytes, 9)
 
 inflate.zlib(z.view(), out) match
-    Ok(n) -> print(s"${str(n)} bytes")
+    Ok(n) -> print(s"${n.to_string()} bytes")
     Err(f) -> print(s"$f")
 ```
 
