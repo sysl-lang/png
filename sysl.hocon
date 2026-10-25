@@ -8,7 +8,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       png { git = "github.com/sysl-lang/png", version = "0.2.0" }
+//       png { git = "github.com/sysl-lang/png", version = "0.2.1" }
 //     }
 //
 // The coordinate names the package, `png`; the modules a program imports are `sh.sysl.png` and,
@@ -17,7 +17,7 @@
 
 package {
   name    = "png"
-  version = "0.2.0"
+  version = "0.2.1"
 
   // **The oldest compiler this builds with**, raised to the one it was last built and tested with.
   sysl = "0.6.0"
