@@ -360,10 +360,10 @@ private filter_row(dst: []u8, data: []const u8, row: usize, rb: usize, y: usize,
 
         val v = f match
             0 -> x
-            1 -> x - a
-            2 -> x - b
-            3 -> x - u8((u32(a) + u32(b)) >> 1)
-            else x - u8(paeth(int(a), int(b), int(c)))
+            1 -> x -% a
+            2 -> x -% b
+            3 -> x -% u8((u32(a) + u32(b)) >> 1)
+            else x -% u8(paeth(int(a), int(b), int(c)))
 
         dst[i] = v
         sum += if v < 128 then usize(v) else 256 - usize(v)

@@ -901,24 +901,24 @@ private unfilter(raw: []u8, stride: usize, height: usize, bpp: usize) -> Result[
             0 -> ()
             1 ->
                 for i in bpp..<n
-                    raw[row + i] += raw[row + i - bpp]
+                    raw[row + i] +%= raw[row + i - bpp]
             2 ->
                 if y > 0
                     for i in 0..<n
-                        raw[row + i] += raw[up + i]
+                        raw[row + i] +%= raw[up + i]
             3 ->
                 for i in 0..<n
                     val a = if i >= bpp then u32(raw[row + i - bpp]) else 0
                     val b = if y > 0 then u32(raw[up + i]) else 0
 
-                    raw[row + i] += u8((a + b) >> 1)
+                    raw[row + i] +%= u8((a + b) >> 1)
             4 ->
                 for i in 0..<n
                     val a = if i >= bpp then int(raw[row + i - bpp]) else 0
                     val b = if y > 0 then int(raw[up + i]) else 0
                     val c = if i >= bpp && y > 0 then int(raw[up + i - bpp]) else 0
 
-                    raw[row + i] += u8(paeth(a, b, c))
+                    raw[row + i] +%= u8(paeth(a, b, c))
             else return Err(BadFilter(kind, y))
 
     Ok(())

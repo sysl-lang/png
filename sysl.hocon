@@ -8,7 +8,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       png { git = "github.com/sysl-lang/png", version = "0.2.2" }
+//       png { git = "github.com/sysl-lang/png", version = "0.2.3" }
 //     }
 //
 // The coordinate names the package, `png`; the modules a program imports are `sh.sysl.png` and,
@@ -17,10 +17,10 @@
 
 package {
   name    = "png"
-  version = "0.2.2"
+  version = "0.2.3"
 
   // **The oldest compiler this builds with**, raised to the one it was last built and tested with.
-  sysl = "0.7.7"
+  sysl = "0.8.0"
 }
 
 // **`heap = true`, and it is the intermediate storage rather than the image.** `decode` gathers the

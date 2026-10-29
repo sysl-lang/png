@@ -229,7 +229,7 @@ private dist_code(t: *Tables, d: usize) -> usize =
 private hash3(src: []const u8, i: usize) -> usize
     val v = u32(src[i]) | u32(src[i + 1]) << 8 | u32(src[i + 2]) << 16
 
-    usize(v * 2654435761 >> (32 - hash_bits))
+    usize(v *% 2654435761 >>(32 - hash_bits))
 
 /** The compressor's state across one stream: the hash chains over the input, and the symbols of the
  * block being gathered.

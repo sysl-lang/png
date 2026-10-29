@@ -85,7 +85,7 @@ private grey_file() -> []u8
     val data: []u8 = [0; 64]
 
     for k in 0..<64usize
-        data[k] = u8(k * 5)
+        data[k] = u8.wrap(k * 5)
 
     var img = image(8, 8, 0, 8, data).unwrap()
 
