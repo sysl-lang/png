@@ -38,7 +38,7 @@ private pieces(file: []const u8) -> Buf[Piece]
 end pieces
 
 // Chunks put together into a file, each with its checksum made fresh.
-private assemble(ps: []const Piece) -> []u8
+private assemble(ps: []const Piece) -> []const u8
     var out: Buf[u8] = buf()
     var crc = crc32_table()
 
@@ -65,7 +65,7 @@ private said(file: []const u8) -> string = decode(file) match
     Err(e) -> s"$e"
 
 // A small paletted image and a small grey one, written by this package.
-private paletted_file(interlaced: bool) -> []u8
+private paletted_file(interlaced: bool) -> []const u8
     val data: []u8 = [0; 16]
 
     for k in 0..<16usize
@@ -81,7 +81,7 @@ private paletted_file(interlaced: bool) -> []u8
     encode(img, o).unwrap().view()
 end paletted_file
 
-private grey_file() -> []u8
+private grey_file() -> []const u8
     val data: []u8 = [0; 64]
 
     for k in 0..<64usize
@@ -94,19 +94,19 @@ private grey_file() -> []u8
 end grey_file
 
 // The chunks of `file` with `p` put in at `at`.
-private with_piece(file: []const u8, at: usize, p: Piece) -> []u8
+private with_piece(file: []const u8, at: usize, p: Piece) -> []const u8
     val ps = pieces(file)
 
     ps.insert(at, p)
     assemble(ps.view())
 
-private without_piece(file: []const u8, at: usize) -> []u8
+private without_piece(file: []const u8, at: usize) -> []const u8
     val ps = pieces(file)
 
     ps.remove(at)
     assemble(ps.view())
 
-private with_body(file: []const u8, at: usize, body: []const u8) -> []u8
+private with_body(file: []const u8, at: usize, body: []const u8) -> []const u8
     val ps = pieces(file)
 
     ps[at] = Piece(ps[at].name, body)
